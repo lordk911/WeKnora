@@ -63,17 +63,27 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Then switch to mirror if specified and install other packages
-RUN if [ -n "$APK_MIRROR_ARG" ]; then \
+# Split into multiple RUNs to avoid vpnkit connection overload on Mac Docker Desktop
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    if [ -n "$APK_MIRROR_ARG" ]; then \
         sed -i "s@deb.debian.org@${APK_MIRROR_ARG}@g" /etc/apt/sources.list.d/debian.sources; \
     fi && \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/80retries && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        build-essential postgresql-client default-mysql-client tzdata sed curl bash vim wget \
-        libsqlite3-0 \
-        python3 python3-pip python3-dev libffi-dev libssl-dev \
-        nodejs npm \
-        gosu \
-        ffmpeg && \
+        build-essential postgresql-client default-mysql-client tzdata sed curl bash wget
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-dev libffi-dev libssl-dev
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get install -y --no-install-recommends nodejs npm
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get install -y --no-install-recommends gosu ffmpeg vim libsqlite3-0
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python3 -m pip install --break-system-packages --upgrade pip setuptools wheel && \
     mkdir -p /home/appuser/.local/bin && \
     curl -LsSf https://astral.sh/uv/install.sh | CARGO_HOME=/home/appuser/.cargo UV_INSTALL_DIR=/home/appuser/.local/bin sh && \
