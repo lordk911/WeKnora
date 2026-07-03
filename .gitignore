@@ -57,3 +57,8 @@ fix-docker.sh
 
 # WeChat Mini Program local/private configuration
 miniprogram/project.private.config.json
+
+# 本地部署产物（含内部环境信息，不进公开仓库）
+deploy/values-production.yaml
+deploy/cert-selfsigned.yaml
+WeKnora部署讨论记录.md
