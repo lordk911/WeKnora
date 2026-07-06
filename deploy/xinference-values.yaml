@@ -13,7 +13,7 @@
 config:
   # Image: retag upstream xprobe/xinference:v2.12.0 and push to Harbor (plan stage A1).
   # Until pushed, this tag will fail to pull — do NOT helm upgrade before A1 completes.
-  xinference_image: "harbor.glodon.com/data-stack/xprobe/xinference:v2.12.0"
+  xinference_image: "harbor.glodon.com/data-stack/xprobe/xinference:v1.9.0-cu128"  # rolled back from v2.12.0 (broken torchcodec/sentence_transformers deps)
   curl_image: harbor-dev.glodon.com/data-stack/curlimages/curl:8.8.0
   image_pull_policy: ""
   model_src: "modelscope"   # ModelScope is reachable inside glodon intranet; overrides upstream "huggingface"
@@ -23,9 +23,10 @@ config:
     mountPath: "/data"
   extra_envs: {}
   # Per-worker layout (xorbitsai/inference#3740).
-  # node41 (2× A40, splitcount=6 → 12× ~8GB vGPU): embed + rerank workers.
-  # node42 (2× A40, splitcount=1 → whole cards): reserved for future self-hosted models
-  #   (VLM/LLM go via Bailian API per plan); no Xinference worker scheduled there.
+  # Current (v1.9.0 tonight): 2 workers on node41 for bge-m3 + bge-reranker.
+  # Planned 6-worker layout (jina-clip-v2 / Qwen3-VL-Reranker-8B / 27B need v2.11.0,
+  # tomorrow): see deploy/xinference-resource-plan.md — node41 4 shared via
+  # nvidia.com/gpumem-percentage, node42 2 whole-card (27B + reserve).
   workers:
     - name: worker-0          # hosts bge-m3 (text embedding)
       nodeSelector:
@@ -39,13 +40,11 @@ config:
       resources:
         requests: {cpu: "4", memory: "16Gi", nvidia.com/gpu: "1"}
         limits:   {cpu: "8", memory: "32Gi", nvidia.com/gpu: "1"}
-    # To activate a reserved node42 worker later, uncomment:
-    # - name: worker-2
-    #   nodeSelector:
-    #     kubernetes.io/hostname: "xa-k8s-node42-gpu"
-    #   resources:
-    #     requests: {cpu: "8", memory: "32Gi", nvidia.com/gpu: "1"}
-    #     limits:   {cpu: "16", memory: "64Gi", nvidia.com/gpu: "1"}
+    # Planned (enable with v2.11.0 tomorrow) — see deploy/xinference-resource-plan.md:
+    # - name: worker-2  # node41 GPU1, gpumem 25% → jina-clip-v2 (multimodal embed)
+    # - name: worker-3  # node41 GPU1, gpumem 40% → Qwen3-VL-Reranker-8B (multimodal rerank)
+    # - name: worker-4  # node42 GPU0, whole card → 27B compact LLM
+    # - name: worker-5  # node42 GPU1, whole card → reserve
 
 # Shared model cache (reused across workers; existing PVC is kept via helm.sh/resource-policy).
 pvc:
