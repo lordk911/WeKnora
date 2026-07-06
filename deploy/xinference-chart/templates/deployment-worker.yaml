@@ -1,0 +1,113 @@
+{{/*
+  WeKnora fork: per-worker Deployments (xorbitsai/inference#3740).
+  Range over .Values.config.workers; each entry renders one Deployment named
+  <release>-<worker.name> with its own resources / nodeSelector / image.
+  Falls back to global xinferenceWorker.worker defaults for args / ports when the
+  worker entry omits them.
+*/}}
+{{- range $i, $worker := .Values.config.workers }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "charts.fullname" $ }}-{{ $worker.name }}
+  labels:
+  {{- include "charts.labels" $ | nindent 4 }}
+spec:
+  replicas: {{ $worker.replica | default 1 | int }}
+  selector:
+    matchLabels:
+      app: xinference-worker
+      worker-name: {{ $worker.name }}
+    {{- include "charts.selectorLabels" $ | nindent 6 }}
+  strategy:
+    type: {{ $.Values.xinferenceWorker.strategy.type }}
+  template:
+    metadata:
+      labels:
+        app: xinference-worker
+        worker-name: {{ $worker.name }}
+      {{- include "charts.selectorLabels" $ | nindent 8 }}
+    spec:
+      {{- if $.Values.config.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml $.Values.config.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- with $worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+      - name: check-supervisor
+        image: {{ $.Values.config.curl_image | quote }}
+        command: {{- toYaml $.Values.xinferenceWorker.worker.initContainers.command | nindent 8 }}
+      containers:
+      - args: {{- toYaml $.Values.xinferenceWorker.worker.args | nindent 8 }}
+        command:
+        - xinference-worker
+        env:
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: status.podIP
+        - name: XINFERENCE_MODEL_SRC
+          value: {{ $.Values.config.model_src }}
+{{- if $.Values.config.persistence.enabled }}
+        - name: XINFERENCE_HOME
+          value: {{ $.Values.config.persistence.mountPath }}
+{{- end }}
+{{- range $key, $value := $.Values.config.extra_envs }}
+        - name: {{ $key }}
+          value: {{ $value | quote }}
+{{- end }}
+        - name: XINFERENCE_POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+{{- if $worker.image }}
+        image: {{ $worker.image | quote }}
+{{- else if $.Values.config.xinference_image }}
+        image: {{ $.Values.config.xinference_image | quote }}
+{{- else }}
+        image: "xprobe/xinference:{{ $.Chart.AppVersion }}"
+{{- end }}
+{{- if $.Values.config.image_pull_policy }}
+        imagePullPolicy: {{ $.Values.config.image_pull_policy }}
+{{- end }}
+        name: worker
+        ports: {{- toYaml $.Values.xinferenceWorker.worker.ports | nindent 10 }}
+        resources:
+          {{- if and $worker.vgpu $worker.vgpu.enabled }}
+          {{- toYaml $worker.vgpu.resources | nindent 10 }}
+          {{- else if $worker.resources }}
+          {{- toYaml $worker.resources | nindent 10 }}
+          {{- else }}
+          {{- include "charts.worker.resources" $ | nindent 10 }}
+          {{- end }}
+{{- if $.Values.config.persistence.enabled }}
+        volumeMounts:
+          - mountPath: {{ $.Values.config.persistence.mountPath }}
+            name: xinference-home
+      volumes:
+        - name: xinference-home
+          persistentVolumeClaim:
+            claimName: xinference-shared-volume-claim
+{{- end }}
+{{- end }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-worker
+  labels:
+  {{- include "charts.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.serviceWorker.type }}
+  selector:
+    app: xinference-worker
+  {{- include "charts.selectorLabels" . | nindent 4 }}
+  ports:
+	{{- .Values.serviceWorker.ports | toYaml | nindent 2 }}

@@ -1,0 +1,163 @@
+# common used configurations
+config:
+  xinference_image: ""
+  curl_image: curlimages/curl:8.8.0
+  image_pull_policy: ""
+  worker_num: 1
+  model_src: "huggingface"
+  persistence:
+    enabled: false
+    # When false (default), no PV/StorageClass is created — the PVC binds dynamically
+    # to the storageClassName set under `pvc`. Set true for the legacy local-storage PV.
+    createPV: false
+    mountPath: "/data"
+  # Per-worker Deployments (xorbitsai/inference#3740). Each entry renders one
+  # Deployment <release>-<name> with its own resources/nodeSelector/image.
+  # When empty, no worker Deployment is rendered (set them in your values file).
+  workers: []
+  # example:
+  # workers:
+  #   - name: worker-0
+  #     replica: 1
+  #     nodeSelector: {kubernetes.io/hostname: gpu-node-a}
+  #     image: "registry/xprobe/xinference:v2.12.0"   # optional, overrides xinference_image
+  #     resources:
+  #       requests: {cpu: "8", memory: 32Gi, nvidia.com/gpu: "1"}
+  #       limits:   {cpu: "16", memory: 64Gi, nvidia.com/gpu: "1"}
+  #     vgpu:                  # optional HAMi fine-grained vGPU
+  #       enabled: true
+  #       resources:
+  #         requests: {cpu: "8", memory: 32Gi}
+  #         limits: {cpu: "16", memory: 64Gi, nvidia.com/gpu: "1", nvidia.com/gpumem-percentage: 30, nvidia.com/gpucores: 30}
+  # any other environments
+  extra_envs: {}
+storageClass:
+  name: local-storage
+  spec:
+    # place your configs here for the storage class
+    provisioner: kubernetes.io/no-provisioner
+    volumeBindingMode: WaitForFirstConsumer
+pv:
+  accessModes:
+    - ReadWriteMany
+  capacity:
+    # actually no limit for local-storage.
+    # if you want to change this, your storage class should support `resize`
+    storage: 20Gi
+  hostPath:
+    path: /tmp/xinference
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: "local-storage"
+pvc:
+  accessModes:
+    # the volume can be mounted as read-write by many nodes.
+    - ReadWriteMany
+  sharedVolumeClaim:
+    storageRequest: 10Gi
+  storageClassName: "local-storage"
+  volumeMode: ""
+serviceWeb:
+  ports:
+  - nodePort: 30003
+    port: 9997
+    protocol: TCP
+    targetPort: 9997
+  # change this to `LoadBalancer` if you use cloud platform
+  type: NodePort
+serviceSupervisor:
+  ports:
+  - name: service-supervisor-oscar
+    port: 9999
+    protocol: TCP
+    targetPort: 9999
+  - name: service-supervisor-web
+    port: 9997
+    protocol: TCP
+    targetPort: 9997
+  type: ClusterIP
+serviceWorker:
+  ports:
+  - port: 30001
+    protocol: TCP
+    targetPort: 30001
+  type: ClusterIP
+xinferenceSupervisor:
+  supervisor:
+    image: ""
+    args:
+    - --port
+    - "9997"
+    - --host
+    - $(POD_IP)
+    - --supervisor-port
+    - "9999"
+    - --log-level
+    - debug
+    ports:
+      - containerPort: 9997
+        name: web
+      - containerPort: 9999
+        name: oscar
+    resources:
+      # Supervisor is a control-plane process (model registry/API gateway); it does NOT
+      # need a GPU. The upstream chart default requests nvidia.com/gpu:1, which HAMi
+      # rejects ("no binding pod found"). Removed here.
+      requests:
+        cpu: "1"
+        memory: 4Gi
+      limits:
+        cpu: "1"
+        memory: 4Gi
+    vgpu:
+      # enable HAMi vgpu
+      enabled: false
+      resources:
+        requests:
+          cpu: "1"
+          memory: 4Gi
+        limits:
+          cpu: "1"
+          memory: 4Gi
+          nvidia.com/gpu: "1"
+          nvidia.com/gpumem-percentage: 100
+          nvidia.com/gpucores: 100
+xinferenceWorker:
+  strategy:
+    type: Recreate
+  worker:
+    initContainers:
+      command: [ 'sh', '-c', "until curl -v http://service-supervisor:9997/v1/address; do echo waiting for supervisor; sleep 1; done" ]
+    image: ""
+    args:
+    - -e
+    - http://service-supervisor:9997
+    - --host
+    - $(POD_IP)
+    - --worker-port
+    - "30001"
+    - --log-level
+    - debug
+    ports:
+      - containerPort: 30001
+    resources:
+      requests:
+        cpu: "2"
+        memory: 8Gi
+        nvidia.com/gpu: "1"
+      limits:
+        cpu: "2"
+        memory: 8Gi
+        nvidia.com/gpu: "1"
+    vgpu:
+      # enable HAMi vgpu
+      enabled: false
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+        limits:
+          cpu: "2"
+          memory: 8Gi
+          nvidia.com/gpu: "1"
+          nvidia.com/gpumem-percentage: 100
+          nvidia.com/gpucores: 100

@@ -1,0 +1,58 @@
+# HAMi upgrade values (v2.6.1 -> v2.9.0) for WeKnora cluster (xa-k8s.local).
+#
+# The cluster nodes cannot pull docker.io. The HAMi v2.9.0 binary image
+# (projecthami/hami) must be pushed to Harbor first:
+#   docker pull docker.m.daocloud.io/projecthami/hami:v2.9.0
+#   docker tag  docker.m.daocloud.io/projecthami/hami:v2.9.0 \
+#              harbor.glodon.com/data-stack/projecthami/hami:v2.9.0
+#   docker push harbor.glodon.com/data-stack/projecthami/hami:v2.9.0
+#
+# Apply with:
+#   helm -n kube-system upgrade hami hami/hami --version 2.9.0 \
+#     -f deploy/hami-values.yaml
+
+# Preserve the kube-scheduler image tag pinned during the v2.6.1 install.
+scheduler:
+  kubeScheduler:
+    imageTag: "v1.32.5"
+  # Admission webhook is REQUIRED for HAMi GPU binding (without it every GPU pod
+  # fails "no binding pod found"). The certgen patch Jobs pull docker.io images the
+  # cluster can't reach, so override patch.image / patch.imageNew to Harbor mirrors:
+  #   docker pull docker.m.daocloud.io/liangjw/kube-webhook-certgen:v1.1.1
+  #   docker tag  docker.m.daocloud.io/liangjw/kube-webhook-certgen:v1.1.1 \
+  #              harbor.glodon.com/data-stack/liangjw/kube-webhook-certgen:v1.1.1
+  #   docker push harbor.glodon.com/data-stack/liangjw/kube-webhook-certgen:v1.1.1
+  #   (same for jettech/kube-webhook-certgen:v1.5.2)
+  admissionWebhook:
+    enabled: true
+  # patch is a sibling of admissionWebhook under scheduler (NOT admissionWebhook.patch).
+  # certgen images were already mirrored to harbor-dev during the v2.6.1 install
+  # (see /Users/shin/Downloads/hami/values.yaml) — reuse them, no re-push needed.
+  patch:
+    enabled: true
+    image:
+      registry: "harbor-dev.glodon.com"
+      repository: "data-stack/docker.io/jettech/kube-webhook-certgen"
+      tag: "v1.5.2"
+    imageNew:
+      registry: "harbor-dev.glodon.com"
+      repository: "data-stack/liangjw/kube-webhook-certgen"
+      tag: "v1.1.1"
+  # scheduler-extender sidecar uses the hami binary image -> point to Harbor.
+  extender:
+    image:
+      registry: "harbor.glodon.com/data-stack"
+      repository: "projecthami/hami"
+      tag: "v2.9.0"
+
+# device-plugin (and vgpu-monitor) use the hami binary image -> point to Harbor.
+devicePlugin:
+  image:
+    registry: "harbor.glodon.com/data-stack"
+    repository: "projecthami/hami"
+    tag: "v2.9.0"
+  monitor:
+    image:
+      registry: "harbor.glodon.com/data-stack"
+      repository: "projecthami/hami"
+      tag: "v2.9.0"
