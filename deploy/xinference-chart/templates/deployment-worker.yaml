@@ -86,11 +86,23 @@ spec:
           {{- else }}
           {{- include "charts.worker.resources" $ | nindent 10 }}
           {{- end }}
-{{- if $.Values.config.persistence.enabled }}
         volumeMounts:
+          # /dev/shm backed by Memory (default k8s shm is only 64MiB, too small
+          # for NCCL's shared-memory segments — distributed vLLM TP>1 dies with
+          # "No space left on device" creating /dev/shm/nccl-*). 2Gi is enough
+          # for the NCCL shm region on a 2-rank TP group.
+          - mountPath: /dev/shm
+            name: dshm
+{{- if $.Values.config.persistence.enabled }}
           - mountPath: {{ $.Values.config.persistence.mountPath }}
             name: xinference-home
+{{- end }}
       volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ $.Values.xinferenceWorker.devShmSize | default "2Gi" }}
+{{- if $.Values.config.persistence.enabled }}
         - name: xinference-home
           persistentVolumeClaim:
             claimName: xinference-shared-volume-claim
