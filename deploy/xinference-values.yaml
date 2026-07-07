@@ -59,16 +59,13 @@ config:
           requests: {cpu: "6", memory: "16Gi", nvidia.com/gpu: "1"}
           limits:   {cpu: "12", memory: "32Gi", nvidia.com/gpu: "1", nvidia.com/gpumem-percentage: "40", nvidia.com/gpucores: "40"}
     # node42 — 27B LLM (whole card) + reserve
-    - name: worker-4          # Qwen3.6-27B-FP8 (official FP8, ~27GB, 1 A40)
+    # node42 — 27B LLM, tensor-parallel=2 across both A40s (96GB) for 128K context
+    - name: worker-4          # Qwen3.6-27B-FP8 (official FP8, ~27GB; --n-gpu 2 --max-model-len 131072)
       nodeSelector: {kubernetes.io/hostname: "xa-k8s-node42-gpu"}
       resources:
-        requests: {cpu: "16", memory: "64Gi", nvidia.com/gpu: "1"}
-        limits:   {cpu: "32", memory: "128Gi", nvidia.com/gpu: "1"}
-    - name: worker-5          # reserve (whole card, no model yet)
-      nodeSelector: {kubernetes.io/hostname: "xa-k8s-node42-gpu"}
-      resources:
-        requests: {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
-        limits:   {cpu: "8", memory: "16Gi", nvidia.com/gpu: "1"}
+        requests: {cpu: "32", memory: "128Gi", nvidia.com/gpu: "2"}
+        limits:   {cpu: "64", memory: "256Gi", nvidia.com/gpu: "2"}
+    # worker-5 removed — both node42 A40s go to worker-4 for 128K context (no reserve)
 
 # Shared model cache (reused across workers; existing PVC is kept via helm.sh/resource-policy).
 pvc:
