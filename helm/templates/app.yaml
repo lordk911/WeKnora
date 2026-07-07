@@ -17,11 +17,11 @@ spec:
   selector:
     matchLabels:
       {{- include "weknora.componentSelectorLabels" (dict "component" "app" "context" .) | nindent 6 }}
+  # dataFiles PVC 是 RWO（rook-ceph-block），单副本下 RollingUpdate 会死锁：
+  # 新 pod 拿不到卷 → 卡 ContainerCreating → 旧 pod 不删 → 卷不释放。
+  # Recreate 先删旧 pod 释放 RWO 卷，再建新 pod。多副本前须把 dataFiles 改 RWX。
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
+    type: Recreate
   template:
     metadata:
       labels:
