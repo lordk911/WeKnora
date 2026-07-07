@@ -13,7 +13,7 @@
 config:
   # Image: retag upstream xprobe/xinference:v2.12.0 and push to Harbor (plan stage A1).
   # Until pushed, this tag will fail to pull — do NOT helm upgrade before A1 completes.
-  xinference_image: "harbor.glodon.com/data-stack/xprobe/xinference:v1.9.0-cu128"  # rolled back from v2.12.0 (broken torchcodec/sentence_transformers deps)
+  xinference_image: "harbor.glodon.com/data-stack/xprobe/xinference:v2.12.0"  # v2.12.0 + vLLM engine bypasses torchcodec bug
   curl_image: harbor-dev.glodon.com/data-stack/curlimages/curl:8.8.0
   image_pull_policy: ""
   model_src: "modelscope"   # ModelScope is reachable inside glodon intranet; overrides upstream "huggingface"
@@ -22,29 +22,53 @@ config:
     createPV: false         # rook-cephfs binds dynamically; no local-storage PV needed
     mountPath: "/data"
   extra_envs: {}
-  # Per-worker layout (xorbitsai/inference#3740).
-  # Current (v1.9.0 tonight): 2 workers on node41 for bge-m3 + bge-reranker.
-  # Planned 6-worker layout (jina-clip-v2 / Qwen3-VL-Reranker-8B / 27B need v2.11.0,
-  # tomorrow): see deploy/xinference-resource-plan.md — node41 4 shared via
-  # nvidia.com/gpumem-percentage, node42 2 whole-card (27B + reserve).
+  # Per-worker layout (xorbitsai/inference#3740). Full Qwen3 set on v2.12.0 + vLLM.
+  # vLLM default gpu_memory_utilization=0.9 grabs 90% of visible GPU; to share one
+  # physical A40 among multiple workers, give each a HAMi vGPU slice via
+  # nvidia.com/gpumem-percentage (vLLM then sees only that slice). See
+  # deploy/xinference-resource-plan.md.
   workers:
-    - name: worker-0          # hosts bge-m3 (text embedding)
-      nodeSelector:
-        kubernetes.io/hostname: "xa-k8s-node41-gpu"
+    # node41 GPU0 — text embed + rerank (small, ~2GB each)
+    - name: worker-0          # Qwen3-Embedding-0.6B (text embedding, dim 1024)
+      nodeSelector: {kubernetes.io/hostname: "xa-k8s-node41-gpu"}
+      vgpu:
+        enabled: true
+        resources:
+          requests: {cpu: "6", memory: "16Gi", nvidia.com/gpu: "1"}
+          limits:   {cpu: "12", memory: "32Gi", nvidia.com/gpu: "1", nvidia.com/gpumem-percentage: "30", nvidia.com/gpucores: "30"}
+    - name: worker-1          # Qwen3-Reranker-0.6B (text rerank)
+      nodeSelector: {kubernetes.io/hostname: "xa-k8s-node41-gpu"}
+      vgpu:
+        enabled: true
+        resources:
+          requests: {cpu: "6", memory: "16Gi", nvidia.com/gpu: "1"}
+          limits:   {cpu: "12", memory: "32Gi", nvidia.com/gpu: "1", nvidia.com/gpumem-percentage: "30", nvidia.com/gpucores: "30"}
+    # node41 GPU1 — multimodal embed + rerank
+    - name: worker-2          # Qwen3-VL-Embedding-2B (multimodal embed)
+      nodeSelector: {kubernetes.io/hostname: "xa-k8s-node41-gpu"}
+      vgpu:
+        enabled: true
+        resources:
+          requests: {cpu: "6", memory: "16Gi", nvidia.com/gpu: "1"}
+          limits:   {cpu: "12", memory: "32Gi", nvidia.com/gpu: "1", nvidia.com/gpumem-percentage: "40", nvidia.com/gpucores: "40"}
+    - name: worker-3          # Qwen3-VL-Reranker-2B (multimodal rerank)
+      nodeSelector: {kubernetes.io/hostname: "xa-k8s-node41-gpu"}
+      vgpu:
+        enabled: true
+        resources:
+          requests: {cpu: "6", memory: "16Gi", nvidia.com/gpu: "1"}
+          limits:   {cpu: "12", memory: "32Gi", nvidia.com/gpu: "1", nvidia.com/gpumem-percentage: "40", nvidia.com/gpucores: "40"}
+    # node42 — 27B LLM (whole card) + reserve
+    - name: worker-4          # Qwen3.6-27B-FP8 (official FP8, ~27GB, 1 A40)
+      nodeSelector: {kubernetes.io/hostname: "xa-k8s-node42-gpu"}
       resources:
-        requests: {cpu: "8", memory: "32Gi", nvidia.com/gpu: "1"}
-        limits:   {cpu: "16", memory: "64Gi", nvidia.com/gpu: "1"}
-    - name: worker-1          # hosts bge-reranker-v2-m3 (text rerank, GPU not CPU)
-      nodeSelector:
-        kubernetes.io/hostname: "xa-k8s-node41-gpu"
+        requests: {cpu: "16", memory: "64Gi", nvidia.com/gpu: "1"}
+        limits:   {cpu: "32", memory: "128Gi", nvidia.com/gpu: "1"}
+    - name: worker-5          # reserve (whole card, no model yet)
+      nodeSelector: {kubernetes.io/hostname: "xa-k8s-node42-gpu"}
       resources:
-        requests: {cpu: "4", memory: "16Gi", nvidia.com/gpu: "1"}
-        limits:   {cpu: "8", memory: "32Gi", nvidia.com/gpu: "1"}
-    # Planned (enable with v2.11.0 tomorrow) — see deploy/xinference-resource-plan.md:
-    # - name: worker-2  # node41 GPU1, gpumem 25% → jina-clip-v2 (multimodal embed)
-    # - name: worker-3  # node41 GPU1, gpumem 40% → Qwen3-VL-Reranker-8B (multimodal rerank)
-    # - name: worker-4  # node42 GPU0, whole card → 27B compact LLM
-    # - name: worker-5  # node42 GPU1, whole card → reserve
+        requests: {cpu: "4", memory: "8Gi", nvidia.com/gpu: "1"}
+        limits:   {cpu: "8", memory: "16Gi", nvidia.com/gpu: "1"}
 
 # Shared model cache (reused across workers; existing PVC is kept via helm.sh/resource-policy).
 pvc:
