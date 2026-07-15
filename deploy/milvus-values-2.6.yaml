@@ -1,0 +1,185 @@
+# Milvus 2.6 (chart milvus-helm/milvus-5.0.24) 部署值
+# 目标:在 glodon 内网 k8s (10.9.27.27, ns=milvus) 干净重建 Milvus,修掉旧部署的根因。
+#
+# 旧部署根因 (已诊断, 见 memory weknora-milvus-binlog-bloat-diagnosis):
+#   全组件 QoS=BestEffort (无 requests/limits) + etcd liveness 探针过严
+#   (timeout 5-10s, failureThreshold 5) → etcd 被 BestEffort 邻居抢 CPU 后探针超时
+#   → 反复被 kubelet 杀 (Exit 0, 非崩溃) → 级联重启 → compaction 停摆 → binlog 堆 3TiB
+#   + indexnode DataCodec segfault crashloop (4747 次)。
+# 本 values 的核心修复: etcd Guaranteed QoS + 探针调宽 + 各组件给 Burstable requests。
+#
+# 镜像 (harbor 内网, 需先 mirror, 仅 2 个):
+#   milvusdb/milvus:v2.6.20          → harbor.glodon.com/data-stack/milvusdb/milvus:v2.6.20
+#   docker.io/milvusdb/etcd:3.5.25-r1 → harbor-dev.glodon.com/data-stack/milvusdb/etcd:3.5.25-r1
+# attu UI (可选): harbor-dev.glodon.com/data-stack/zilliz/attu:v2.5.3 (harbor-dev 已有)
+# MQ: embedded woodpecker (2.6 默认, WAL 嵌 streamingnode/datanode 进程, 落外部 MinIO,
+#     无独立 pulsar/woodpecker 镜像, 最简)。pulsar/pulsarv3 子 chart 显式关闭。
+
+## ---------- 集群模式 ----------
+cluster:
+  enabled: true
+
+## ---------- MQ: pulsar (bundled pulsarv3, battle-tested) ----------
+# embedded woodpecker 连外部 S3 是 2.6 已知 bug (issue #44485), streamingnode WAL init 失败
+# → 回退 pulsar walimpls 连 localhost:6650 → DDL 全卡。切回 pulsarv3 (跟旧 2.5 一致)。
+# 需 mirror: apachepulsar/pulsar:3.0.7 → harbor.glodon.com/data-stack/apachepulsar/pulsar:3.0.7
+woodpecker:
+  enabled: false              # embedded + 外部 S3 bug, 不用
+pulsar:
+  enabled: false              # 用 pulsarv3 不是 pulsar
+pulsarv3:
+  enabled: true               # 部署 bundled pulsarv3 + config.tpl 选 pulsar MQ
+  # initialize 不设 (默认 false): helm install 时 .Release.IsInstall=true 会自动跑 pulsar-init job 初始化 cluster;
+  # 以后 helm upgrade (IsInstall=false) 不会重跑 Job (cluster 已初始化, 不该再 init)。
+  # 只有在 upgrade 时想强制重 init 才临时设 initialize:true (正常别开, 会 patch 已完成 Job 报错)。
+  images:                     # 5 个组件共用 pulsar 镜像, 全 override 到 harbor
+    zookeeper:    { repository: harbor.glodon.com/data-stack/apachepulsar/pulsar, tag: "3.0.7" }
+    bookie:       { repository: harbor.glodon.com/data-stack/apachepulsar/pulsar, tag: "3.0.7" }
+    autorecovery: { repository: harbor.glodon.com/data-stack/apachepulsar/pulsar, tag: "3.0.7" }
+    broker:       { repository: harbor.glodon.com/data-stack/apachepulsar/pulsar, tag: "3.0.7" }
+    proxy:        { repository: harbor.glodon.com/data-stack/apachepulsar/pulsar, tag: "3.0.7" }
+  pulsar_metadata:            # pulsar-init job + initContainer (wait-zookeeper/verify-clusterid) 用的, 单独 image 字段
+    image:
+      repository: harbor.glodon.com/data-stack/apachepulsar/pulsar
+      tag: "3.0.7"
+messageQueue: pulsar
+
+## ---------- 对象存储: 外部 MinIO (复用集群现有 minio.minio.svc) ----------
+minio:
+  enabled: false              # 不用 bundled minio
+externalS3:
+  enabled: true
+  host: minio.minio.svc.cluster.local
+  port: 9000
+  accessKey: milvus_admin
+  secretKey: admin#milvus@k8s   # TODO: 改 externalS3.existingSecret 引用 Secret, 别留明文
+  bucketName: milvus
+  rootPath: file              # 跟旧部署一致; 重建前务必 mc rm --recursive 清空 file/ 前缀
+  useSSL: false
+  cloudProvider: aws
+  useIAM: false
+  useVirtualHost: false
+
+## ---------- 镜像: override 到 harbor ----------
+image:
+  all:
+    repository: harbor.glodon.com/data-stack/milvusdb/milvus
+    tag: v2.6.20
+    pullPolicy: IfNotPresent
+
+## ---------- 认证 (跟生产一致, 必须带!) ----------
+# 生产 user.yaml 开了 authorizationEnabled:true。Dify 虽然 MILVUS_USER/PASSWORD 空,
+# 但 Milvus 首启会建 root 空密码, 空 cred 能连(跟现在行为一致)。不带这行 → auth 关 → 行为变。
+extraConfigFiles:
+  user.yaml: |+
+    common:
+      security:
+        authorizationEnabled: true
+
+## ---------- metrics (跟生产, prometheus 抓 9091) ----------
+metrics:
+  enabled: true
+
+## ---------- milvus 组件 liveness/readiness (跟生产 initialDelay 90 + 调宽防死循环) ----------
+# 顶层 livenessProbe 应用到所有 milvus 组件 (proxy/querynode/datanode/streamingnode/mixcoord)。
+# 生产 initialDelay 90 + timeout 5/failure 5 (跟 etcd 一样过严)。这里调宽 timeout/failure,
+# 配合 Burstable 资源, 防组件被探针打死级联 (跟 etcd 同理)。
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 90      # 跟生产一致, 给启动留 grace
+  periodSeconds: 30
+  timeoutSeconds: 30           # 默认 5 → 30
+  failureThreshold: 10         # 默认 5 → 10
+  successThreshold: 1
+readinessProbe:
+  enabled: true
+  initialDelaySeconds: 90
+  periodSeconds: 10
+  timeoutSeconds: 15
+  failureThreshold: 10
+  successThreshold: 1
+
+## ---------- etcd: Guaranteed QoS + 探针调宽 (核心修复!) ----------
+etcd:
+  enabled: true
+  replicaCount: 3
+  image:
+    registry: harbor.glodon.com/data-stack    # bitnami 子 chart: registry + repository 拆分
+    repository: milvusdb/etcd                  # 拼 → harbor.glodon.com/data-stack/milvusdb/etcd
+    tag: 3.5.25-r1
+    pullPolicy: IfNotPresent
+  # Guaranteed QoS: request=limit, 保证 etcd 不被邻居抢 CPU (旧部署 BestEffort 是死循环根因)
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+  # 探针调宽: bitnami etcd 默认 timeoutSeconds:5 failureThreshold:5 太严,
+  # etcd 一慢就被杀重启级联。改 60s/10 给 GC/compaction 抖动留余量。
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 60
+    periodSeconds: 60          # 默认 30 → 60, 降低探针频率
+    timeoutSeconds: 30         # 默认 5 → 30
+    failureThreshold: 10      # 默认 5 → 10
+    successThreshold: 1
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 60
+    periodSeconds: 15
+    timeoutSeconds: 15
+    failureThreshold: 10
+    successThreshold: 1
+
+## ---------- 各 milvus 组件: Burstable (给最低 requests, 别再 BestEffort) ----------
+# mixcoord (2.6 合一的协调器, 替代旧 rootcoord/datacoord/querycoord/indexcoord)
+mixCoordinator:
+  enabled: true
+  replicas: 1
+  resources:
+    requests: { cpu: "500m", memory: "2Gi" }
+# 2.6 默认不部署 indexnode/indexcoord (合进 datanode/mixcoord)
+index_node:
+  enabled: false
+index_coordinator:
+  enabled: false
+
+dataCoord:
+  enabled: true
+  replicas: 1
+  resources:
+    requests: { cpu: "500m", memory: "2Gi" }
+dataNode:
+  enabled: true
+  replicas: 3                   # 匹配 prod (dify 索引负载); 2.6 兼索引
+  resources:
+    requests: { cpu: "500m", memory: "4Gi" }   # 兼索引, 给多点
+queryNode:
+  enabled: true
+  replicas: 2                   # 匹配 prod (查询并发)
+  resources:
+    requests: { cpu: "500m", memory: "4Gi" }
+  disk:
+    enabled: true             # enableDisk, 跟旧部署一致
+streamingNode:
+  enabled: true
+  replicas: 1
+  resources:
+    requests: { cpu: "500m", memory: "4Gi" }   # embedded woodpecker WAL 在这, 给够
+proxy:
+  enabled: true
+  replicas: 1
+  resources:
+    requests: { cpu: "500m", memory: "1Gi" }
+
+## ---------- Attu UI (可选, 跟旧部署一致) ----------
+attu:
+  enabled: true
+  image:
+    repository: harbor-dev.glodon.com/data-stack/zilliz/attu
+    tag: v2.5.3
+  service:
+    type: ClusterIP           # 跟生产一致 (生产 attu ClusterIP:3000, port-forward 访问)
+    port: 3000                # 想直接浏览器访问可改 NodePort + nodePort:30008

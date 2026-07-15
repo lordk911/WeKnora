@@ -1,0 +1,89 @@
+# PrometheusRule: infra 告警 (ceph/minio/milvus)
+# 应用: kubectl apply -f deploy/monitoring-prometheusrules.yaml
+# 注: 部分指标名(minio bucket size)若跟实际不符, prometheus rule eval 报错, 跑后按 prometheus targets 实际 metric 名调
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: infra-alerts
+  namespace: prometheus
+  labels:
+    release: prometheus-stack
+spec:
+  groups:
+  # ===== Ceph =====
+  - name: ceph
+    rules:
+    - alert: CephHealthNotOk
+      expr: ceph_health_status != 0   # 0=OK 1=WARN 2=ERR
+      for: 15m
+      labels: {severity: critical}
+      annotations:
+        summary: "Ceph 集群不健康 (status={{$value}})"
+        description: "Ceph health 非 OK, 查 ceph health detail"
+    - alert: CephOSDDown
+      expr: ceph_osd_down > 0
+      for: 5m
+      labels: {severity: critical}
+      annotations:
+        summary: "Ceph 有 {{$value}} 个 OSD down"
+    - alert: CephUsageNearFull
+      expr: (ceph_cluster_total_used_bytes / ceph_cluster_total_bytes) > 0.70
+      for: 30m
+      labels: {severity: warning}
+      annotations:
+        summary: "Ceph 容量 > 70%"
+    - alert: CephPGDegraded
+      expr: ceph_pg_degraded > 0
+      for: 10m
+      labels: {severity: warning}
+      annotations:
+        summary: "Ceph 有 {{$value}} 个 degraded PG"
+
+  # ===== MinIO =====
+  - name: minio
+    rules:
+    - alert: MinIODriveOffline
+      expr: minio_cluster_drive_offline_total > 0
+      for: 5m
+      labels: {severity: critical}
+      annotations:
+        summary: "MinIO 有 {{$value}} 个 drive offline"
+    - alert: MinIODiskNearFull
+      expr: max(minio_node_disk_used_bytes / minio_node_disk_total_bytes) > 0.75
+      for: 30m
+      labels: {severity: warning}
+      annotations:
+        summary: "MinIO 某盘用量 > 75%"
+    - alert: MinIOPodNotReady
+      expr: kube_statefulset_status_replicas{statefulset="minio"} < kube_statefulset_replicas{statefulset="minio"}
+      for: 5m
+      labels: {severity: critical}
+      annotations:
+        summary: "MinIO StatefulSet 有 pod 不 ready"
+    # ★ 防 milvus binlog 把 MinIO 写满 3TiB 的事故重演
+    - alert: MilvusBucketBloat
+      expr: max(minio_bucket_usage_total_bytes{bucket="milvus"}) > 1500000000000   # 1.5TiB
+      for: 1h
+      labels: {severity: critical}
+      annotations:
+        summary: "MinIO milvus bucket > 1.5TiB (binlog 膨胀风险, 防上次 3TiB 写满复发)"
+        description: "查 milvus compaction 是否停摆 + etcd 是否抖动, 见 memory weknora-milvus-binlog-bloat-diagnosis"
+
+  # ===== Milvus =====
+  - name: milvus
+    rules:
+    # ★ 防 milvus 组件死循环级联重启 (etcd BestEffort 死循环的症状)
+    - alert: MilvusPodRestartLoop
+      expr: increase(kube_pod_container_status_restarts_total{pod=~"milvus-.*"}[30m]) > 3
+      for: 1m
+      labels: {severity: critical}
+      annotations:
+        summary: "Milvus pod 30 分钟内重启 >3 次 (死循环风险)"
+        description: "查 etcd 是否抖动 + datacoord compaction 是否停摆"
+    - alert: MilvusProxyDown
+      expr: kube_deployment_status_replicas_available{deployment=~"milvus-proxy"} < 1
+      for: 5m
+      labels: {severity: critical}
+      annotations:
+        summary: "Milvus proxy 不可用"
