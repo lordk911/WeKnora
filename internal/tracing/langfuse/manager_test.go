@@ -2,11 +2,7 @@ package langfuse
 
 import (
 	"context"
-	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 )
@@ -32,35 +28,12 @@ func TestManager_DisabledIsNoop(t *testing.T) {
 	}
 }
 
-// TestManager_FullRoundTrip boots a fake Langfuse server, runs a trace +
-// generation through the manager, and asserts the ingested payload contains
-// the expected ids, model name and usage.
+// TestManager_FullRoundTrip boots a fake OTLP endpoint, runs a trace +
+// generation through the manager, and asserts the ingested OTLP payload
+// contains a generation span carrying the model name and token usage, sharing
+// the trace id of the root span.
 func TestManager_FullRoundTrip(t *testing.T) {
-	var mu sync.Mutex
-	var batches []ingestionRequest
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/public/ingestion" {
-			t.Errorf("unexpected path: %s", r.URL.Path)
-			w.WriteHeader(404)
-			return
-		}
-		if auth := r.Header.Get("Authorization"); auth == "" {
-			t.Errorf("missing Authorization header")
-		}
-		body, _ := io.ReadAll(r.Body)
-		var req ingestionRequest
-		if err := json.Unmarshal(body, &req); err != nil {
-			t.Errorf("decode body: %v", err)
-			w.WriteHeader(400)
-			return
-		}
-		mu.Lock()
-		batches = append(batches, req)
-		mu.Unlock()
-		w.WriteHeader(200)
-		w.Write([]byte(`{}`))
-	}))
+	srv, drain := otlpTestServer(t)
 	defer srv.Close()
 
 	m, err := Init(Config{
@@ -68,8 +41,8 @@ func TestManager_FullRoundTrip(t *testing.T) {
 		Host:           srv.URL,
 		PublicKey:      "pk",
 		SecretKey:      "sk",
-		FlushAt:        1,
-		FlushInterval:  10 * time.Millisecond,
+		FlushAt:        16,
+		FlushInterval:  1 * time.Second,
 		QueueSize:      16,
 		RequestTimeout: 2 * time.Second,
 		SampleRate:     1.0,
@@ -94,37 +67,26 @@ func TestManager_FullRoundTrip(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-
-	// We should have received at least:
-	//   trace-create, generation-create, generation-update, trace-create(update)
-	// possibly split across multiple HTTP calls depending on batching.
-	var events []ingestionEvent
-	for _, b := range batches {
-		events = append(events, b.Batch...)
-	}
-	if len(events) < 4 {
-		t.Fatalf("expected >=4 events, got %d: %+v", len(events), events)
-	}
-
-	var sawGenerationUpdate bool
-	for _, ev := range events {
-		if ev.Type != "generation-update" {
+	spans := drain()
+	wantTrace := traceIDHex(trace.ID)
+	var sawGeneration bool
+	for _, sp := range spans {
+		if spanType(sp) != "generation" {
 			continue
 		}
-		b, _ := json.Marshal(ev.Body)
-		var body observationBody
-		_ = json.Unmarshal(b, &body)
-		if body.Usage == nil || body.Usage.Total != 30 {
-			t.Errorf("expected usage total=30, got %+v", body.Usage)
+		if sp["traceId"] != wantTrace {
+			t.Errorf("generation trace id mismatch: got %s want %s", sp["traceId"], wantTrace)
 		}
-		if body.TraceID != trace.ID {
-			t.Errorf("generation trace id mismatch: got %s want %s", body.TraceID, trace.ID)
+		if spanAttrStr(sp, "langfuse.observation.model.name") != "gpt-test" {
+			t.Errorf("model mismatch: got %q", spanAttrStr(sp, "langfuse.observation.model.name"))
 		}
-		sawGenerationUpdate = true
+		usage := spanAttrStr(sp, "langfuse.observation.usage_details")
+		if !strings.Contains(usage, `"total":30`) {
+			t.Errorf("expected usage_details to contain total:30, got %q", usage)
+		}
+		sawGeneration = true
 	}
-	if !sawGenerationUpdate {
-		t.Fatalf("no generation-update event found")
+	if !sawGeneration {
+		t.Fatalf("no generation span found in %d spans", len(spans))
 	}
 }

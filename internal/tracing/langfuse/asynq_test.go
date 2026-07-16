@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"testing"
 	"time"
 
@@ -62,7 +61,7 @@ func TestInjectTracing_PopulatesFromContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	defer m.Shutdown(context.Background())
+	defer func() { _ = m.Shutdown(context.Background()) }()
 
 	ctx, trace := m.StartTrace(context.Background(), TraceOptions{Name: "parent"})
 	ctx, span := m.StartSpan(ctx, SpanOptions{Name: "wrap"})
@@ -93,23 +92,12 @@ func TestInjectTracing_PopulatesFromContext(t *testing.T) {
 }
 
 // TestAsynqMiddleware_ResumeTrace asserts the middleware grafts a resumed
-// trace onto the child handler's context, and that the ingestion endpoint
-// receives span-create / span-update events for the wrapper — without
-// emitting a duplicate trace-create (which would split the Langfuse UI
-// tree into two disconnected roots).
+// trace onto the child handler's context, and that the OTLP endpoint
+// receives a worker span whose traceId/parentSpanId derive from the
+// payload-stamped upstream ids — without emitting a duplicate root trace
+// span (which would split the Langfuse UI tree into two disconnected roots).
 func TestAsynqMiddleware_ResumeTrace(t *testing.T) {
-	var mu sync.Mutex
-	var batches []ingestionRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var req ingestionRequest
-		_ = json.Unmarshal(body, &req)
-		mu.Lock()
-		batches = append(batches, req)
-		mu.Unlock()
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(`{}`))
-	}))
+	srv, drain := otlpTestServer(t)
 	defer srv.Close()
 
 	m, err := Init(Config{
@@ -127,16 +115,19 @@ func TestAsynqMiddleware_ResumeTrace(t *testing.T) {
 		t.Fatalf("init: %v", err)
 	}
 
-	// Build a payload that already carries a trace id (as if the HTTP layer
-	// injected one at enqueue time).
+	// Build a payload that already carries an upstream trace id (as if the
+	// HTTP layer injected one at enqueue time). Use real UUID-shaped hex so
+	// the OTel trace/span id derivation is faithful to production.
+	upstreamTrace := newID()
+	upstreamParent := newID()
 	payload := &dummyPayload{KnowledgeID: "k1"}
-	payload.LangfuseTraceID = "trace-xyz"
-	payload.LangfuseParentObservationID = "parent-span-abc"
+	payload.LangfuseTraceID = upstreamTrace
+	payload.LangfuseParentObservationID = upstreamParent
 	raw, _ := json.Marshal(payload)
 
 	var receivedTraceID, receivedParentID string
 	var sawTrace bool
-	handler := asynq.HandlerFunc(func(ctx context.Context, task *asynq.Task) error {
+	handler := asynq.HandlerFunc(func(ctx context.Context, _ *asynq.Task) error {
 		if tr, ok := TraceFromContext(ctx); ok && tr != nil {
 			sawTrace = true
 			receivedTraceID = tr.ID
@@ -158,8 +149,8 @@ func TestAsynqMiddleware_ResumeTrace(t *testing.T) {
 	if !sawTrace {
 		t.Fatal("expected handler ctx to carry a resumed trace")
 	}
-	if receivedTraceID != "trace-xyz" {
-		t.Errorf("trace id mismatch: got %q want trace-xyz", receivedTraceID)
+	if receivedTraceID != upstreamTrace {
+		t.Errorf("trace id mismatch: got %q want %q", receivedTraceID, upstreamTrace)
 	}
 	if receivedParentID == "" {
 		t.Error("expected parent observation to be set to the wrapper span id")
@@ -169,40 +160,26 @@ func TestAsynqMiddleware_ResumeTrace(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	var sawSpanCreate, sawSpanUpdate, sawTraceCreate bool
-	for _, b := range batches {
-		for _, ev := range b.Batch {
-			switch ev.Type {
-			case "span-create":
-				sawSpanCreate = true
-				// Resumed span should attach to the supplied trace id, not
-				// a fresh one we made up in the worker.
-				body, _ := json.Marshal(ev.Body)
-				var ob observationBody
-				_ = json.Unmarshal(body, &ob)
-				if ob.TraceID != "trace-xyz" {
-					t.Errorf("span-create trace id = %q, want trace-xyz", ob.TraceID)
-				}
-				if ob.ParentObservationID != "parent-span-abc" {
-					t.Errorf("span-create parentObservationId = %q, want parent-span-abc", ob.ParentObservationID)
-				}
-			case "span-update":
-				sawSpanUpdate = true
-			case "trace-create":
-				sawTraceCreate = true
-			}
+	wantTrace := traceIDHex(upstreamTrace)
+	wantParent := spanIDHex(upstreamParent)
+	var sawWorkerSpan, sawRootTrace bool
+	for _, sp := range drain() {
+		if spanType(sp) == "trace" {
+			sawRootTrace = true
+		}
+		if sp["traceId"] != wantTrace {
+			continue
+		}
+		// The worker's wrapper span attaches to the upstream parent.
+		if sp["parentSpanId"] == wantParent {
+			sawWorkerSpan = true
 		}
 	}
-	if !sawSpanCreate {
-		t.Error("missing span-create event")
+	if !sawWorkerSpan {
+		t.Error("missing worker span stamped with upstream trace+parent ids")
 	}
-	if !sawSpanUpdate {
-		t.Error("missing span-update event")
-	}
-	if sawTraceCreate {
-		t.Error("resumed trace should not emit trace-create events (parent owns them)")
+	if sawRootTrace {
+		t.Error("resumed trace should not emit a root trace span (HTTP parent owns it)")
 	}
 }
 
@@ -211,18 +188,7 @@ func TestAsynqMiddleware_ResumeTrace(t *testing.T) {
 // standalone trace tagged with the task type, so the worker-side work
 // still shows up in Langfuse.
 func TestAsynqMiddleware_StandaloneTrace(t *testing.T) {
-	var mu sync.Mutex
-	var batches []ingestionRequest
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var req ingestionRequest
-		_ = json.Unmarshal(body, &req)
-		mu.Lock()
-		batches = append(batches, req)
-		mu.Unlock()
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(`{}`))
-	}))
+	srv, drain := otlpTestServer(t)
 	defer srv.Close()
 
 	m, err := Init(Config{
@@ -237,7 +203,7 @@ func TestAsynqMiddleware_StandaloneTrace(t *testing.T) {
 	payload := &dummyPayload{KnowledgeID: "kX"}
 	raw, _ := json.Marshal(payload)
 
-	handler := asynq.HandlerFunc(func(ctx context.Context, task *asynq.Task) error { return nil })
+	handler := asynq.HandlerFunc(func(context.Context, *asynq.Task) error { return nil })
 	wrapped := AsynqMiddleware()(handler)
 	if err := wrapped.ProcessTask(context.Background(), asynq.NewTask("scheduled:ping", raw)); err != nil {
 		t.Fatalf("handler err: %v", err)
@@ -247,26 +213,16 @@ func TestAsynqMiddleware_StandaloneTrace(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
-	// Langfuse uses trace-create events both on open and on update (the
-	// server merges by id), so we filter to the initial event that carries
-	// the Name — the finalizing update has no name.
-	var sawNamedTraceCreate bool
-	for _, b := range batches {
-		for _, ev := range b.Batch {
-			if ev.Type != "trace-create" {
-				continue
-			}
-			body, _ := json.Marshal(ev.Body)
-			var tb traceBody
-			_ = json.Unmarshal(body, &tb)
-			if tb.Name == "asynq.scheduled:ping" {
-				sawNamedTraceCreate = true
-			}
+	var sawNamedRoot bool
+	for _, sp := range drain() {
+		if spanType(sp) != "trace" {
+			continue
+		}
+		if sp["name"] == "asynq.scheduled:ping" {
+			sawNamedRoot = true
 		}
 	}
-	if !sawNamedTraceCreate {
-		t.Error("standalone run should emit a trace-create with name=asynq.scheduled:ping")
+	if !sawNamedRoot {
+		t.Error("standalone run should emit a root trace span named asynq.scheduled:ping")
 	}
 }

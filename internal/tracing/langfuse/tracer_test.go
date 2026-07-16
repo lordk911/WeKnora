@@ -12,32 +12,43 @@ import (
 	"time"
 )
 
-// newTestServer spins up a fake Langfuse ingestion endpoint and returns the
-// collected events + a cleanup func.
-func newTestServer(t *testing.T) (*httptest.Server, func() []ingestionEvent) {
+// otlpTestServer spins up a fake OTLP /api/public/otel/v1/traces endpoint
+// and returns a drain func yielding every decoded span across all flushes.
+func otlpTestServer(t *testing.T) (*httptest.Server, func() []map[string]interface{}) {
 	t.Helper()
 	var mu sync.Mutex
-	var batches []ingestionRequest
+	var spans []map[string]interface{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		var req ingestionRequest
+		var req map[string]interface{}
 		_ = json.Unmarshal(body, &req)
 		mu.Lock()
-		batches = append(batches, req)
-		mu.Unlock()
+		defer mu.Unlock()
+		for _, rs := range asSlice(req["resourceSpans"]) {
+			for _, ss := range asSlice(rs.(map[string]interface{})["scopeSpans"]) {
+				for _, sp := range asSlice(ss.(map[string]interface{})["spans"]) {
+					spans = append(spans, sp.(map[string]interface{}))
+				}
+			}
+		}
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte(`{}`))
 	}))
-	drain := func() []ingestionEvent {
+	drain := func() []map[string]interface{} {
 		mu.Lock()
 		defer mu.Unlock()
-		var out []ingestionEvent
-		for _, b := range batches {
-			out = append(out, b.Batch...)
-		}
+		out := make([]map[string]interface{}, len(spans))
+		copy(out, spans)
 		return out
 	}
 	return srv, drain
+}
+
+func asSlice(v interface{}) []interface{} {
+	if s, ok := v.([]interface{}); ok {
+		return s
+	}
+	return nil
 }
 
 func newTestManager(t *testing.T, host string) *Manager {
@@ -47,8 +58,8 @@ func newTestManager(t *testing.T, host string) *Manager {
 		Host:           host,
 		PublicKey:      "pk",
 		SecretKey:      "sk",
-		FlushAt:        1,
-		FlushInterval:  5 * time.Millisecond,
+		FlushAt:        16,
+		FlushInterval:  1 * time.Second,
 		QueueSize:      32,
 		RequestTimeout: 2 * time.Second,
 		SampleRate:     1.0,
@@ -59,11 +70,46 @@ func newTestManager(t *testing.T, host string) *Manager {
 	return m
 }
 
+// spanAttrStr returns the stringValue of a span attribute, or "" if absent.
+func spanAttrStr(sp map[string]interface{}, key string) string {
+	for _, a := range asSlice(sp["attributes"]) {
+		am, _ := a.(map[string]interface{})
+		if am["key"] != key {
+			continue
+		}
+		if v, ok := am["value"].(map[string]interface{}); ok {
+			if s, ok := v["stringValue"].(string); ok {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+// spanType returns the langfuse.observation.type of a span.
+func spanType(sp map[string]interface{}) string {
+	return spanAttrStr(sp, "langfuse.observation.type")
+}
+
+func spanStatus(sp map[string]interface{}) (code, message string) {
+	st, ok := sp["status"].(map[string]interface{})
+	if !ok {
+		return "", ""
+	}
+	if c, ok := st["code"].(string); ok {
+		code = c
+	}
+	if m, ok := st["message"].(string); ok {
+		message = m
+	}
+	return
+}
+
 // TestSpan_NestedHierarchy verifies that nested StartSpan calls produce a
-// trace → span₁ → span₂ → generation hierarchy, with parentObservationId
-// pointing to the direct ancestor at each level.
+// trace → span₁ → span₂ → generation tree, with parentSpanId pointing to
+// the direct ancestor at each level (derived from the parent observation id).
 func TestSpan_NestedHierarchy(t *testing.T) {
-	srv, drain := newTestServer(t)
+	srv, drain := otlpTestServer(t)
 	defer srv.Close()
 	m := newTestManager(t, srv.URL)
 
@@ -81,43 +127,55 @@ func TestSpan_NestedHierarchy(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 
-	events := drain()
-	parentOf := map[string]string{}
-	traceOf := map[string]string{}
-	kindOf := map[string]string{}
-	for _, ev := range events {
-		if ev.Type != "span-create" && ev.Type != "generation-create" {
-			continue
+	spans := drain()
+	wantTrace := traceIDHex(trace.ID)
+	bySpanID := map[string]map[string]interface{}{}
+	for _, sp := range spans {
+		bySpanID[sp["spanId"].(string)] = sp
+		if sp["traceId"] != wantTrace {
+			t.Errorf("span %q has traceId %q want %q", sp["name"], sp["traceId"], wantTrace)
 		}
-		b, _ := json.Marshal(ev.Body)
-		var ob observationBody
-		_ = json.Unmarshal(b, &ob)
-		parentOf[ob.ID] = ob.ParentObservationID
-		traceOf[ob.ID] = ob.TraceID
-		kindOf[ob.ID] = ob.Type
 	}
 
-	if traceOf[outer.ID] != trace.ID || parentOf[outer.ID] != "" {
-		t.Errorf("outer span should sit directly under the trace, got parent=%q trace=%q", parentOf[outer.ID], traceOf[outer.ID])
+	rootID := spanIDHex(trace.ID)
+	outerSp := bySpanID[spanIDHex(outer.ID)]
+	if outerSp == nil {
+		t.Fatalf("missing outer span %q", spanIDHex(outer.ID))
 	}
-	if parentOf[inner.ID] != outer.ID {
-		t.Errorf("inner span parent mismatch: got %q want %q", parentOf[inner.ID], outer.ID)
+	if outerSp["parentSpanId"] != rootID {
+		t.Errorf("outer parentSpanId = %v want %q", outerSp["parentSpanId"], rootID)
 	}
-	if parentOf[gen.ID] != inner.ID {
-		t.Errorf("generation should nest under inner span, got parent=%q want %q", parentOf[gen.ID], inner.ID)
+	if spanType(outerSp) != "span" {
+		t.Errorf("outer type = %q want span", spanType(outerSp))
 	}
-	if kindOf[outer.ID] != "SPAN" || kindOf[inner.ID] != "SPAN" {
-		t.Errorf("expected both wrappers to be SPAN observations, got outer=%q inner=%q", kindOf[outer.ID], kindOf[inner.ID])
+
+	innerSp := bySpanID[spanIDHex(inner.ID)]
+	if innerSp == nil {
+		t.Fatalf("missing inner span")
 	}
-	if kindOf[gen.ID] != "GENERATION" {
-		t.Errorf("expected generation kind, got %q", kindOf[gen.ID])
+	if innerSp["parentSpanId"] != spanIDHex(outer.ID) {
+		t.Errorf("inner parentSpanId = %v want %q", innerSp["parentSpanId"], spanIDHex(outer.ID))
+	}
+	if spanType(innerSp) != "span" {
+		t.Errorf("inner type = %q want span", spanType(innerSp))
+	}
+
+	genSp := bySpanID[spanIDHex(gen.ID)]
+	if genSp == nil {
+		t.Fatalf("missing generation span")
+	}
+	if genSp["parentSpanId"] != spanIDHex(inner.ID) {
+		t.Errorf("generation parentSpanId = %v want %q", genSp["parentSpanId"], spanIDHex(inner.ID))
+	}
+	if spanType(genSp) != "generation" {
+		t.Errorf("generation type = %q want generation", spanType(genSp))
 	}
 }
 
 // TestSpan_FinishWithError records an error status on the span so failures in
 // asynq handlers surface as red observations in Langfuse.
 func TestSpan_FinishWithError(t *testing.T) {
-	srv, drain := newTestServer(t)
+	srv, drain := otlpTestServer(t)
 	defer srv.Close()
 	m := newTestManager(t, srv.URL)
 
@@ -130,27 +188,24 @@ func TestSpan_FinishWithError(t *testing.T) {
 	}
 
 	var sawError bool
-	for _, ev := range drain() {
-		if ev.Type != "span-update" {
+	for _, sp := range drain() {
+		if spanAttrStr(sp, "langfuse.observation.status_message") != "kaboom" {
 			continue
 		}
-		b, _ := json.Marshal(ev.Body)
-		var ob observationBody
-		_ = json.Unmarshal(b, &ob)
-		if ob.Level == "ERROR" && ob.StatusMessage == "kaboom" {
+		if code, _ := spanStatus(sp); code == "STATUS_CODE_ERROR" {
 			sawError = true
 		}
 	}
 	if !sawError {
-		t.Fatal("expected span-update with ERROR level and status message")
+		t.Fatal("expected a span with ERROR status and status_message=kaboom")
 	}
 }
 
-// TestResumeTrace_NoTraceCreateEvent verifies that ResumeTrace does NOT
-// emit a trace-create event — the originating HTTP handler already did,
-// and a duplicate would register as an orphan root in the Langfuse UI.
+// TestResumeTrace_NoTraceCreateEvent verifies that ResumeTrace does NOT emit
+// a root trace span — the originating HTTP handler already did, and a
+// duplicate would register as an orphan root in the Langfuse UI.
 func TestResumeTrace_NoTraceCreateEvent(t *testing.T) {
-	srv, drain := newTestServer(t)
+	srv, drain := otlpTestServer(t)
 	defer srv.Close()
 	m := newTestManager(t, srv.URL)
 
@@ -162,8 +217,8 @@ func TestResumeTrace_NoTraceCreateEvent(t *testing.T) {
 		t.Errorf("expected parent observation upstream-span on ctx, got %q (ok=%v)", pid, ok)
 	}
 
-	// Emit one child so there's *something* to flush, proving only child
-	// observations reach the wire, not a trace-create for the resume.
+	// Emit one child so there's something to flush, proving only child
+	// observations reach the wire — not a root trace span for the resume.
 	_, span := m.StartSpan(ctx, SpanOptions{Name: "child"})
 	span.Finish(nil, nil, nil)
 
@@ -171,9 +226,9 @@ func TestResumeTrace_NoTraceCreateEvent(t *testing.T) {
 		t.Fatalf("shutdown: %v", err)
 	}
 
-	for _, ev := range drain() {
-		if ev.Type == "trace-create" {
-			t.Fatalf("ResumeTrace must not emit trace-create events, got %+v", ev)
+	for _, sp := range drain() {
+		if spanType(sp) == "trace" {
+			t.Fatalf("ResumeTrace must not emit a root trace span, got %v", sp["name"])
 		}
 	}
 }
