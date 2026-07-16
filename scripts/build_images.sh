@@ -77,17 +77,20 @@ check_docker() {
 # 检测平台
 check_platform() {
     log_info "检测系统平台信息..."
-    if [ "$(uname -m)" = "x86_64" ]; then
-        export PLATFORM="linux/amd64"
-        export TARGETARCH="amd64"
-    elif [ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ]; then
-        export PLATFORM="linux/arm64"
-        export TARGETARCH="arm64"
+    # 默认 linux/amd64：WeKnora 目标 k8s 集群节点全为 amd64。即使在本机 arm64
+    # Mac (Apple Silicon) 上构建，也必须产 amd64 镜像（否则 pod exec format error）；
+    # buildx 会经 QEMU 模拟 amd64（较慢，20-40min）。如需构建其他架构，显式
+    # export PLATFORM=linux/arm64 后再调本脚本。
+    if [ -n "${PLATFORM:-}" ]; then
+        : # 尊重显式 env 覆盖
     else
-        log_warning "未识别的平台类型：$(uname -m)，将使用默认平台 linux/amd64"
         export PLATFORM="linux/amd64"
-        export TARGETARCH="amd64"
     fi
+    case "$PLATFORM" in
+        *amd64) export TARGETARCH="amd64" ;;
+        *arm64|*arm) export TARGETARCH="arm64" ;;
+        *) export TARGETARCH="amd64" ;;
+    esac
     log_info "当前平台：$PLATFORM"
     log_info "当前架构：$TARGETARCH"
 }
