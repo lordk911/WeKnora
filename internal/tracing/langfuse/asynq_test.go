@@ -3,11 +3,8 @@ package langfuse
 import (
 	"context"
 	"encoding/json"
-	"io"
-	"net/http"
-	"net/http/httptest"
+	"strings"
 	"testing"
-	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/hibiken/asynq"
@@ -23,206 +20,104 @@ type dummyPayload struct {
 // TestInjectTracing_DisabledIsZero verifies InjectTracing is a no-op when
 // Langfuse is disabled: no panics, no trace fields written.
 func TestInjectTracing_DisabledIsZero(t *testing.T) {
-	// Explicitly install a disabled manager to shadow any globally-enabled
-	// one from a previous test in the same package.
 	_, _ = Init(Config{Enabled: false})
 
 	p := &dummyPayload{KnowledgeID: "k1"}
 	InjectTracing(context.Background(), p)
-	if p.LangfuseTraceID != "" || p.LangfuseParentObservationID != "" {
+	if p.LangfuseTraceparent != "" || p.LangfuseTraceID != "" {
 		t.Fatalf("expected no tracing fields on disabled manager, got %+v", p.TracingContext)
 	}
 }
 
-// TestInjectTracing_PopulatesFromContext checks that when a trace is active
-// on the context, its id is copied onto the payload and a subsequent
-// peekTracingContext round-trips it correctly.
-func TestInjectTracing_PopulatesFromContext(t *testing.T) {
-	// Stand up a fake ingestion endpoint — Init starts a real flush worker
-	// and we don't want it to panic on connection refused during the test.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer srv.Close()
-
-	m, err := Init(Config{
-		Enabled:        true,
-		Host:           srv.URL,
-		PublicKey:      "pk",
-		SecretKey:      "sk",
-		FlushAt:        16,
-		FlushInterval:  50 * time.Millisecond,
-		QueueSize:      16,
-		RequestTimeout: 2 * time.Second,
-		SampleRate:     1.0,
-	})
-	if err != nil {
-		t.Fatalf("init: %v", err)
-	}
-	defer func() { _ = m.Shutdown(context.Background()) }()
+// TestInjectTracing_PopulatesTraceparent checks that when a trace is active
+// on the context, a W3C traceparent is stamped onto the payload (so the
+// asynq worker can resume the same trace).
+func TestInjectTracing_PopulatesTraceparent(t *testing.T) {
+	m, _ := newTestManager(t)
 
 	ctx, trace := m.StartTrace(context.Background(), TraceOptions{Name: "parent"})
-	ctx, span := m.StartSpan(ctx, SpanOptions{Name: "wrap"})
-	if span == nil || span.ID == "" {
-		t.Fatalf("expected a span with id, got %+v", span)
-	}
-
 	p := &dummyPayload{KnowledgeID: "k1"}
 	InjectTracing(ctx, p)
 
+	if p.LangfuseTraceparent == "" {
+		t.Fatal("expected LangfuseTraceparent to be populated")
+	}
+	// The traceparent carries the trace id; trace.ID is the OTel trace id.
+	if !strings.HasPrefix(p.LangfuseTraceparent, "00-"+trace.ID) {
+		t.Errorf("traceparent %q does not carry trace id %s", p.LangfuseTraceparent, trace.ID)
+	}
 	if p.LangfuseTraceID != trace.ID {
-		t.Errorf("trace id mismatch: got %q want %q", p.LangfuseTraceID, trace.ID)
-	}
-	if p.LangfuseParentObservationID != span.ID {
-		t.Errorf("parent observation id mismatch: got %q want %q", p.LangfuseParentObservationID, span.ID)
-	}
-
-	// Round-trip the payload through JSON, which is what asynq does on the
-	// wire, and make sure peekTracingContext recovers the ids.
-	b, err := json.Marshal(p)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	got := peekTracingContext(b)
-	if got.LangfuseTraceID != trace.ID || got.LangfuseParentObservationID != span.ID {
-		t.Errorf("peek round-trip lost ids: %+v", got)
+		t.Errorf("LangfuseTraceID = %q, want %q", p.LangfuseTraceID, trace.ID)
 	}
 }
 
-// TestAsynqMiddleware_ResumeTrace asserts the middleware grafts a resumed
-// trace onto the child handler's context, and that the OTLP endpoint
-// receives a worker span whose traceId/parentSpanId derive from the
-// payload-stamped upstream ids — without emitting a duplicate root trace
-// span (which would split the Langfuse UI tree into two disconnected roots).
-func TestAsynqMiddleware_ResumeTrace(t *testing.T) {
-	srv, drain := otlpTestServer(t)
-	defer srv.Close()
+// TestAsynqMiddleware_TraceparentPropagation is the cross-process correlation
+// core test: InjectTracing stamps a traceparent onto the payload; the worker
+// middleware re-extracts it, and the worker span inherits the upstream trace
+// id — stitching the HTTP trace and the async job into one LiteFuse tree.
+func TestAsynqMiddleware_TraceparentPropagation(t *testing.T) {
+	m, exp := newTestManager(t)
 
-	m, err := Init(Config{
-		Enabled:        true,
-		Host:           srv.URL,
-		PublicKey:      "pk",
-		SecretKey:      "sk",
-		FlushAt:        1,
-		FlushInterval:  5 * time.Millisecond,
-		QueueSize:      32,
-		RequestTimeout: 2 * time.Second,
-		SampleRate:     1.0,
-	})
-	if err != nil {
-		t.Fatalf("init: %v", err)
-	}
-
-	// Build a payload that already carries an upstream trace id (as if the
-	// HTTP layer injected one at enqueue time). Use real UUID-shaped hex so
-	// the OTel trace/span id derivation is faithful to production.
-	upstreamTrace := newID()
-	upstreamParent := newID()
+	// Upstream caller opens a span and injects a traceparent onto the payload.
+	upstreamCtx, upstreamSpan := m.Tracer().Start(context.Background(), "upstream-http")
+	remoteTraceID := upstreamSpan.SpanContext().TraceID()
 	payload := &dummyPayload{KnowledgeID: "k1"}
-	payload.LangfuseTraceID = upstreamTrace
-	payload.LangfuseParentObservationID = upstreamParent
+	InjectTracing(upstreamCtx, payload)
+	if payload.LangfuseTraceparent == "" {
+		t.Fatal("InjectTracing did not stamp a traceparent")
+	}
 	raw, _ := json.Marshal(payload)
 
-	var receivedTraceID, receivedParentID string
-	var sawTrace bool
-	handler := asynq.HandlerFunc(func(ctx context.Context, _ *asynq.Task) error {
-		if tr, ok := TraceFromContext(ctx); ok && tr != nil {
-			sawTrace = true
-			receivedTraceID = tr.ID
-		}
-		if pid, ok := parentObservationFromCtx(ctx); ok {
-			receivedParentID = pid
-		}
-		return nil
-	})
-
-	mw := AsynqMiddleware()
-	wrapped := mw(handler)
-
-	task := asynq.NewTask("test:type", raw)
-	if err := wrapped.ProcessTask(context.Background(), task); err != nil {
+	mw := AsynqMiddleware()(asynq.HandlerFunc(func(context.Context, *asynq.Task) error { return nil }))
+	if err := mw.ProcessTask(context.Background(), asynq.NewTask("test:type", raw)); err != nil {
 		t.Fatalf("handler err: %v", err)
 	}
 
-	if !sawTrace {
-		t.Fatal("expected handler ctx to carry a resumed trace")
-	}
-	if receivedTraceID != upstreamTrace {
-		t.Errorf("trace id mismatch: got %q want %q", receivedTraceID, upstreamTrace)
-	}
-	if receivedParentID == "" {
-		t.Error("expected parent observation to be set to the wrapper span id")
-	}
-
-	if err := m.Shutdown(context.Background()); err != nil {
-		t.Fatalf("shutdown: %v", err)
-	}
-
-	wantTrace := traceIDHex(upstreamTrace)
-	wantParent := spanIDHex(upstreamParent)
-	var sawWorkerSpan, sawRootTrace bool
-	for _, sp := range drain() {
-		if spanType(sp) == "trace" {
-			sawRootTrace = true
-		}
-		if sp["traceId"] != wantTrace {
+	for _, s := range exp.GetSpans() {
+		if s.Name != "asynq.test:type" {
 			continue
 		}
-		// The worker's wrapper span attaches to the upstream parent.
-		if sp["parentSpanId"] == wantParent {
-			sawWorkerSpan = true
+		if s.SpanContext.TraceID() != remoteTraceID {
+			t.Errorf("worker span trace id = %s, want upstream %s (traceparent not propagated)",
+				s.SpanContext.TraceID(), remoteTraceID)
 		}
+		return
 	}
-	if !sawWorkerSpan {
-		t.Error("missing worker span stamped with upstream trace+parent ids")
-	}
-	if sawRootTrace {
-		t.Error("resumed trace should not emit a root trace span (HTTP parent owns it)")
-	}
+	t.Fatal("asynq worker span not exported")
 }
 
 // TestAsynqMiddleware_StandaloneTrace asserts that when the payload carries
-// NO upstream trace id (e.g. a scheduled job), the middleware opens a
-// standalone trace tagged with the task type, so the worker-side work
-// still shows up in Langfuse.
+// NO upstream traceparent (e.g. a scheduled job), the middleware opens a
+// standalone trace named after the task type.
 func TestAsynqMiddleware_StandaloneTrace(t *testing.T) {
-	srv, drain := otlpTestServer(t)
-	defer srv.Close()
-
-	m, err := Init(Config{
-		Enabled: true, Host: srv.URL, PublicKey: "pk", SecretKey: "sk",
-		FlushAt: 1, FlushInterval: 5 * time.Millisecond, QueueSize: 32,
-		RequestTimeout: 2 * time.Second, SampleRate: 1.0,
-	})
-	if err != nil {
-		t.Fatalf("init: %v", err)
-	}
+	_, exp := newTestManager(t)
 
 	payload := &dummyPayload{KnowledgeID: "kX"}
 	raw, _ := json.Marshal(payload)
 
-	handler := asynq.HandlerFunc(func(context.Context, *asynq.Task) error { return nil })
-	wrapped := AsynqMiddleware()(handler)
-	if err := wrapped.ProcessTask(context.Background(), asynq.NewTask("scheduled:ping", raw)); err != nil {
+	mw := AsynqMiddleware()(asynq.HandlerFunc(func(context.Context, *asynq.Task) error { return nil }))
+	if err := mw.ProcessTask(context.Background(), asynq.NewTask("scheduled:ping", raw)); err != nil {
 		t.Fatalf("handler err: %v", err)
 	}
 
-	if err := m.Shutdown(context.Background()); err != nil {
-		t.Fatalf("shutdown: %v", err)
-	}
-
-	var sawNamedRoot bool
-	for _, sp := range drain() {
-		if spanType(sp) != "trace" {
+	// The standalone run opens a root trace span ("asynq.scheduled:ping",
+	// type=trace) plus a worker span with the same name (type=span).
+	var sawRoot, sawSpan bool
+	for _, s := range exp.GetSpans() {
+		if s.Name != "asynq.scheduled:ping" {
 			continue
 		}
-		if sp["name"] == "asynq.scheduled:ping" {
-			sawNamedRoot = true
+		switch spanType(s) {
+		case obsTypeTrace:
+			sawRoot = true
+		case obsTypeSpan:
+			sawSpan = true
 		}
 	}
-	if !sawNamedRoot {
-		t.Error("standalone run should emit a root trace span named asynq.scheduled:ping")
+	if !sawRoot {
+		t.Error("standalone run should open a root trace span named asynq.scheduled:ping")
+	}
+	if !sawSpan {
+		t.Error("standalone run should open a worker span")
 	}
 }

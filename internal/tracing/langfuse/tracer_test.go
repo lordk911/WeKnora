@@ -2,84 +2,48 @@ package langfuse
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"sync"
+	"strings"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
-// otlpTestServer spins up a fake OTLP /api/public/otel/v1/traces endpoint
-// and returns a drain func yielding every decoded span across all flushes.
-func otlpTestServer(t *testing.T) (*httptest.Server, func() []map[string]interface{}) {
+// newTestManager builds a Manager wired to an in-memory span exporter via the
+// SimpleSpanProcessor (synchronous export on span End), so tests can assert on
+// exported spans deterministically without an HTTP server.
+func newTestManager(t *testing.T) (*Manager, *tracetest.InMemoryExporter) {
 	t.Helper()
-	var mu sync.Mutex
-	var spans []map[string]interface{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		var req map[string]interface{}
-		_ = json.Unmarshal(body, &req)
-		mu.Lock()
-		defer mu.Unlock()
-		for _, rs := range asSlice(req["resourceSpans"]) {
-			for _, ss := range asSlice(rs.(map[string]interface{})["scopeSpans"]) {
-				for _, sp := range asSlice(ss.(map[string]interface{})["spans"]) {
-					spans = append(spans, sp.(map[string]interface{}))
-				}
-			}
-		}
-		w.WriteHeader(200)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	drain := func() []map[string]interface{} {
-		mu.Lock()
-		defer mu.Unlock()
-		out := make([]map[string]interface{}, len(spans))
-		copy(out, spans)
-		return out
-	}
-	return srv, drain
-}
-
-func asSlice(v interface{}) []interface{} {
-	if s, ok := v.([]interface{}); ok {
-		return s
-	}
-	return nil
-}
-
-func newTestManager(t *testing.T, host string) *Manager {
-	t.Helper()
+	exp := tracetest.NewInMemoryExporter()
 	m, err := Init(Config{
 		Enabled:        true,
-		Host:           host,
+		Host:           "http://test",
 		PublicKey:      "pk",
 		SecretKey:      "sk",
-		FlushAt:        16,
+		FlushAt:        1,
 		FlushInterval:  1 * time.Second,
 		QueueSize:      32,
 		RequestTimeout: 2 * time.Second,
 		SampleRate:     1.0,
+		testExporter:   exp,
 	})
 	if err != nil {
 		t.Fatalf("init: %v", err)
 	}
-	return m
+	t.Cleanup(func() { _ = m.Shutdown(context.Background()) })
+	return m, exp
 }
 
-// spanAttrStr returns the stringValue of a span attribute, or "" if absent.
-func spanAttrStr(sp map[string]interface{}, key string) string {
-	for _, a := range asSlice(sp["attributes"]) {
-		am, _ := a.(map[string]interface{})
-		if am["key"] != key {
-			continue
-		}
-		if v, ok := am["value"].(map[string]interface{}); ok {
-			if s, ok := v["stringValue"].(string); ok {
-				return s
+// spanAttr returns the string value of a span attribute, or "" if absent.
+func spanAttr(attrs []attribute.KeyValue, key string) string {
+	for _, kv := range attrs {
+		if string(kv.Key) == key {
+			if v, ok := kv.Value.AsInterface().(string); ok {
+				return v
 			}
 		}
 	}
@@ -87,31 +51,13 @@ func spanAttrStr(sp map[string]interface{}, key string) string {
 }
 
 // spanType returns the langfuse.observation.type of a span.
-func spanType(sp map[string]interface{}) string {
-	return spanAttrStr(sp, "langfuse.observation.type")
-}
+func spanType(s tracetest.SpanStub) string { return spanAttr(s.Attributes, attrObsType) }
 
-func spanStatus(sp map[string]interface{}) (code, message string) {
-	st, ok := sp["status"].(map[string]interface{})
-	if !ok {
-		return "", ""
-	}
-	if c, ok := st["code"].(string); ok {
-		code = c
-	}
-	if m, ok := st["message"].(string); ok {
-		message = m
-	}
-	return
-}
-
-// TestSpan_NestedHierarchy verifies that nested StartSpan calls produce a
-// trace → span₁ → span₂ → generation tree, with parentSpanId pointing to
-// the direct ancestor at each level (derived from the parent observation id).
+// TestSpan_NestedHierarchy verifies nested StartSpan calls produce a
+// trace → span → span → generation tree with correct OTel parent linking
+// (parenting is automatic through trace.SpanFromContext, no manual ids).
 func TestSpan_NestedHierarchy(t *testing.T) {
-	srv, drain := otlpTestServer(t)
-	defer srv.Close()
-	m := newTestManager(t, srv.URL)
+	m, exp := newTestManager(t)
 
 	ctx, trace := m.StartTrace(context.Background(), TraceOptions{Name: "root"})
 	ctx, outer := m.StartSpan(ctx, SpanOptions{Name: "outer"})
@@ -123,128 +69,134 @@ func TestSpan_NestedHierarchy(t *testing.T) {
 	outer.Finish("outer-out", nil, nil)
 	trace.Finish("root-out", nil)
 
-	if err := m.Shutdown(context.Background()); err != nil {
-		t.Fatalf("shutdown: %v", err)
+	spans := exp.GetSpans()
+	if len(spans) != 4 {
+		t.Fatalf("expected 4 spans, got %d", len(spans))
 	}
-
-	spans := drain()
-	wantTrace := traceIDHex(trace.ID)
-	bySpanID := map[string]map[string]interface{}{}
-	for _, sp := range spans {
-		bySpanID[sp["spanId"].(string)] = sp
-		if sp["traceId"] != wantTrace {
-			t.Errorf("span %q has traceId %q want %q", sp["name"], sp["traceId"], wantTrace)
-		}
+	byName := map[string]tracetest.SpanStub{}
+	for _, s := range spans {
+		byName[s.Name] = s
 	}
-
-	rootID := spanIDHex(trace.ID)
-	outerSp := bySpanID[spanIDHex(outer.ID)]
-	if outerSp == nil {
-		t.Fatalf("missing outer span %q", spanIDHex(outer.ID))
+	root, outerS, innerS, genS := byName["root"], byName["outer"], byName["inner"], byName["llm"]
+	if root.Name == "" || outerS.Name == "" || innerS.Name == "" || genS.Name == "" {
+		t.Fatalf("missing expected spans: %+v", byName)
 	}
-	if outerSp["parentSpanId"] != rootID {
-		t.Errorf("outer parentSpanId = %v want %q", outerSp["parentSpanId"], rootID)
+	// All spans share the trace id.
+	if outerS.SpanContext.TraceID() != root.SpanContext.TraceID() ||
+		innerS.SpanContext.TraceID() != root.SpanContext.TraceID() ||
+		genS.SpanContext.TraceID() != root.SpanContext.TraceID() {
+		t.Errorf("all spans must share the root trace id")
 	}
-	if spanType(outerSp) != "span" {
-		t.Errorf("outer type = %q want span", spanType(outerSp))
+	// Parent chain: outer → root, inner → outer, gen → inner.
+	if outerS.Parent.SpanID() != root.SpanContext.SpanID() {
+		t.Errorf("outer parent = %s, want root %s", outerS.Parent.SpanID(), root.SpanContext.SpanID())
 	}
-
-	innerSp := bySpanID[spanIDHex(inner.ID)]
-	if innerSp == nil {
-		t.Fatalf("missing inner span")
+	if innerS.Parent.SpanID() != outerS.SpanContext.SpanID() {
+		t.Errorf("inner parent = %s, want outer %s", innerS.Parent.SpanID(), outerS.SpanContext.SpanID())
 	}
-	if innerSp["parentSpanId"] != spanIDHex(outer.ID) {
-		t.Errorf("inner parentSpanId = %v want %q", innerSp["parentSpanId"], spanIDHex(outer.ID))
+	if genS.Parent.SpanID() != innerS.SpanContext.SpanID() {
+		t.Errorf("gen parent = %s, want inner %s", genS.Parent.SpanID(), innerS.SpanContext.SpanID())
 	}
-	if spanType(innerSp) != "span" {
-		t.Errorf("inner type = %q want span", spanType(innerSp))
+	// Observation types.
+	if spanType(root) != obsTypeTrace {
+		t.Errorf("root type = %q, want %q", spanType(root), obsTypeTrace)
 	}
-
-	genSp := bySpanID[spanIDHex(gen.ID)]
-	if genSp == nil {
-		t.Fatalf("missing generation span")
+	if spanType(outerS) != obsTypeSpan || spanType(innerS) != obsTypeSpan {
+		t.Errorf("outer/inner type not span: %q %q", spanType(outerS), spanType(innerS))
 	}
-	if genSp["parentSpanId"] != spanIDHex(inner.ID) {
-		t.Errorf("generation parentSpanId = %v want %q", genSp["parentSpanId"], spanIDHex(inner.ID))
-	}
-	if spanType(genSp) != "generation" {
-		t.Errorf("generation type = %q want generation", spanType(genSp))
+	if spanType(genS) != obsTypeGeneration {
+		t.Errorf("gen type = %q, want %q", spanType(genS), obsTypeGeneration)
 	}
 }
 
 // TestSpan_FinishWithError records an error status on the span so failures in
 // asynq handlers surface as red observations in Langfuse.
 func TestSpan_FinishWithError(t *testing.T) {
-	srv, drain := otlpTestServer(t)
-	defer srv.Close()
-	m := newTestManager(t, srv.URL)
+	m, exp := newTestManager(t)
 
 	ctx, _ := m.StartTrace(context.Background(), TraceOptions{Name: "root"})
 	_, span := m.StartSpan(ctx, SpanOptions{Name: "boom"})
 	span.Finish(nil, nil, errors.New("kaboom"))
 
-	if err := m.Shutdown(context.Background()); err != nil {
-		t.Fatalf("shutdown: %v", err)
-	}
-
-	var sawError bool
-	for _, sp := range drain() {
-		if spanAttrStr(sp, "langfuse.observation.status_message") != "kaboom" {
+	for _, s := range exp.GetSpans() {
+		if s.Name != "boom" {
 			continue
 		}
-		if code, _ := spanStatus(sp); code == "STATUS_CODE_ERROR" {
-			sawError = true
+		if s.Status.Code != codes.Error {
+			t.Errorf("span status = %v, want Error", s.Status.Code)
 		}
+		if s.Status.Description != "kaboom" {
+			t.Errorf("status description = %q, want kaboom", s.Status.Description)
+		}
+		return
 	}
-	if !sawError {
-		t.Fatal("expected a span with ERROR status and status_message=kaboom")
-	}
+	t.Fatal("boom span not exported")
 }
 
-// TestResumeTrace_NoTraceCreateEvent verifies that ResumeTrace does NOT emit
-// a root trace span — the originating HTTP handler already did, and a
-// duplicate would register as an orphan root in the Langfuse UI.
-func TestResumeTrace_NoTraceCreateEvent(t *testing.T) {
-	srv, drain := otlpTestServer(t)
-	defer srv.Close()
-	m := newTestManager(t, srv.URL)
+// TestManager_FullRoundTrip asserts a generation carries the model name and
+// usage_details attribute (JSON with token counts), and shares the trace id
+// of the root span.
+func TestManager_FullRoundTrip(t *testing.T) {
+	m, exp := newTestManager(t)
 
-	ctx, trace := m.ResumeTrace(context.Background(), "upstream-trace", "upstream-span")
-	if trace == nil || trace.ID != "upstream-trace" {
-		t.Fatalf("expected resumed trace with id upstream-trace, got %+v", trace)
-	}
-	if pid, ok := parentObservationFromCtx(ctx); !ok || pid != "upstream-span" {
-		t.Errorf("expected parent observation upstream-span on ctx, got %q (ok=%v)", pid, ok)
-	}
+	ctx, trace := m.StartTrace(context.Background(), TraceOptions{Name: "test.trace", UserID: "user-42"})
+	_, gen := m.StartGeneration(ctx, GenerationOptions{
+		Name:  "chat.completion",
+		Model: "gpt-test",
+		Input: []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	gen.Finish("hello", &TokenUsage{Input: 10, Output: 20, Total: 30, Unit: "TOKENS"}, nil)
+	trace.Finish("hello", nil)
 
-	// Emit one child so there's something to flush, proving only child
-	// observations reach the wire — not a root trace span for the resume.
-	_, span := m.StartSpan(ctx, SpanOptions{Name: "child"})
-	span.Finish(nil, nil, nil)
-
-	if err := m.Shutdown(context.Background()); err != nil {
-		t.Fatalf("shutdown: %v", err)
-	}
-
-	for _, sp := range drain() {
-		if spanType(sp) == "trace" {
-			t.Fatalf("ResumeTrace must not emit a root trace span, got %v", sp["name"])
+	for _, s := range exp.GetSpans() {
+		if s.Name != "chat.completion" {
+			continue
 		}
+		if spanAttr(s.Attributes, attrObsModel) != "gpt-test" {
+			t.Errorf("model = %q, want gpt-test", spanAttr(s.Attributes, attrObsModel))
+		}
+		usage := spanAttr(s.Attributes, attrObsUsageDetails)
+		if !strings.Contains(usage, `"total":30`) {
+			t.Errorf("usage_details = %q, want total:30", usage)
+		}
+		if s.SpanContext.TraceID().String() != trace.ID {
+			t.Errorf("gen trace id = %s, want %s", s.SpanContext.TraceID(), trace.ID)
+		}
+		return
 	}
+	t.Fatal("generation span not exported")
 }
 
-// TestResumeTrace_DisabledIsSafe guards against nil deref when Langfuse is
-// off: ResumeTrace should return a nil *Trace and the original ctx unchanged.
-func TestResumeTrace_DisabledIsSafe(t *testing.T) {
-	m, err := Init(Config{Enabled: false})
-	if err != nil {
-		t.Fatalf("init: %v", err)
+// TestTraceparentPropagation is the sop3 correlation core test: an incoming
+// W3C traceparent (as injected by an upstream caller like sop3) is extracted,
+// and the WeKnora root span inherits the upstream trace id — so in LiteFuse
+// the WeKnora trace and the upstream caller's trace are the same trace.
+func TestTraceparentPropagation(t *testing.T) {
+	m, exp := newTestManager(t)
+
+	// Simulate an upstream caller carrying a traceparent.
+	upstreamCtx, upstreamSpan := m.Tracer().Start(context.Background(), "upstream-caller")
+	remoteTraceID := upstreamSpan.SpanContext().TraceID()
+	carrier := propagation.MapCarrier{}
+	propagator.Inject(upstreamCtx, carrier)
+	if carrier["traceparent"] == "" {
+		t.Fatal("no traceparent injected")
 	}
-	ctx, trace := m.ResumeTrace(context.Background(), "x", "y")
-	if trace != nil {
-		t.Errorf("expected nil trace when disabled, got %+v", trace)
+
+	// The HTTP middleware extracts the traceparent into the request context.
+	httpCtx := propagator.Extract(context.Background(), carrier)
+	_, trace := m.StartTrace(httpCtx, TraceOptions{Name: "weknora-root"})
+	trace.Finish(nil, nil)
+
+	for _, s := range exp.GetSpans() {
+		if s.Name != "weknora-root" {
+			continue
+		}
+		if s.SpanContext.TraceID() != remoteTraceID {
+			t.Errorf("weknora root trace id = %s, want upstream %s (traceparent not inherited)",
+				s.SpanContext.TraceID(), remoteTraceID)
+		}
+		return
 	}
-	if _, ok := parentObservationFromCtx(ctx); ok {
-		t.Error("disabled ResumeTrace should not attach parent observation")
-	}
+	t.Fatal("weknora-root span not exported")
 }
