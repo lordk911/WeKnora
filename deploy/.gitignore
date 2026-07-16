@@ -4,3 +4,12 @@ doris/vendored/
 # 性能测试报告（本地产物，含测试凭据，不进 git）
 storage-perf-bench-*.md
 litefuse-values-production.yaml
+
+# 集群特定部署文件（公司域名/凭据，存服务器不进 git）（含公司域名/凭据，存服务器不进 git；按需重新生成）
+alertmanager.yaml
+alertmanager-email-patch.yaml
+hami-values.yaml
+milvus-values-*.yaml
+xinference-values.yaml
+xinference-upgrade-plan.md
+ceph-minio-audit-report.md
