@@ -1,0 +1,38 @@
+Litefuse deployed to namespace "{{ .Release.Namespace }}".
+
+Web:     https://{{ .Values.ingress.host }}   (or `kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "litefuse.fullname" . }}-web 3000`)
+Health:  curl http://{{ include "litefuse.fullname" . }}-web.{{ .Release.Namespace }}.svc:3000/api/public/health
+         → {"status":"OK","version":"{{ .Chart.AppVersion }}"}
+
+Dependencies:
+{{- if .Values.redis.enabled }}
+  Redis:   {{ include "litefuse.fullname" . }}-redis.{{ .Release.Namespace }}.svc:6379  (chart-managed)
+{{- else }}
+  Redis:   {{ .Values.redis.external.host }}:{{ .Values.redis.external.port }}  (external)
+{{- end }}
+  Postgres: {{ .Values.postgres.host }}:{{ .Values.postgres.port }}/{{ .Values.postgres.database }}
+  MinIO:    {{ .Values.minio.endpoint }}  bucket={{ .Values.minio.bucket }}
+  Doris:    {{ .Values.doris.feHttpUrl }}  db={{ .Values.doris.database }}
+
+IMPORTANT:
+- This chart expects a pre-created Secret "{{ include "litefuse.secretName" . }}" in namespace "{{ .Release.Namespace }}".
+  See deploy/scripts/litefuse-bootstrap.sh (creates the secret + PG database + MinIO bucket/user).
+  Required keys: NEXTAUTH_SECRET, SALT, ENCRYPTION_KEY, DATABASE_URL, REDIS_AUTH,
+                 MINIO_ACCESS_KEY_ID, MINIO_SECRET_ACCESS_KEY, DORIS_PASSWORD,
+                 LITEFUSE_INIT_PROJECT_PUBLIC_KEY, LITEFUSE_INIT_PROJECT_SECRET_KEY,
+                 LITEFUSE_INIT_USER_PASSWORD.
+- Doris Storage Vault MUST be created and set as default BEFORE Litefuse boots
+  (bootstrap.sh runs the create-storage-vault Job first). Order: FDB → Doris Operator →
+  DDC cluster → Storage Vault → `helm install` this chart.
+- Login at https://{{ .Values.ingress.host }} with the init user (email from values),
+  verify the project public/secret key matches LITEFUSE_INIT_PROJECT_PUBLIC_KEY/SECRET_KEY
+  injected into the Secret — those are the keys WeKnora's Langfuse tracer will use.
+
+WeKnora integration (zero code change — Litefuse is Langfuse wire-protocol compatible):
+  add to deploy/values-production.yaml → app.extraEnv:
+    - { name: LANGFUSE_HOST, value: "https://{{ .Values.ingress.host }}" }
+    - name: LANGFUSE_PUBLIC_KEY
+      valueFrom: { secretKeyRef: { name: {{ include "litefuse.secretName" . }}, key: LITEFUSE_INIT_PROJECT_PUBLIC_KEY } }
+    - name: LANGFUSE_SECRET_KEY
+      valueFrom: { secretKeyRef: { name: {{ include "litefuse.secretName" . }}, key: LITEFUSE_INIT_PROJECT_SECRET_KEY } }
+  (secret is in ns "{{ .Release.Namespace }}"; copy/export to ns weknora, or use an ExternalSecret.)

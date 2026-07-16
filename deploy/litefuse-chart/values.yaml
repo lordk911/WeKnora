@@ -1,0 +1,145 @@
+# Litefuse helm chart 默认 values
+# 生产部署用 deploy/litefuse-values-production.yaml 覆盖（指向目标集群 PG/MinIO/Doris/ingress）。
+# 详细字段说明见 deploy/litefuse-k8s-deploy.md。
+
+global:
+  storageClass: rook-ceph-block   # 目标集群 Rook-Ceph RBD（RWO，可扩容）
+  imagePullSecrets: []            # your-registry/data-stack 公开匿名拉取，无需 secret
+
+# 覆盖 release 全名（默认 <release>-litefuse）
+fullnameOverride: ""
+
+# —— Litefuse Web（API + Next.js 前端，port 3000）——
+web:
+  enabled: true
+  replicaCount: 1                  # 多副本前需确认 NEXTAUTH/ENCRYPTION 一致（已从同一 Secret 注入，可扩）
+  image:
+    repository: your-registry/data-stack/litefuse-web
+    tag: "26.0.1"
+    pullPolicy: IfNotPresent
+  strategy: Recreate              # 与 weknora app 一致，规避 RWO 卷滚动死锁（web 无状态但保持一致）
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: "2",   memory: 4Gi }
+
+# —— Litefuse Worker（队列消费者 + S3 batch export，port 3030）——
+worker:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: your-registry/data-stack/litefuse-worker
+    tag: "26.0.1"
+    pullPolicy: IfNotPresent
+  strategy: Recreate
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: "2",   memory: 4Gi }
+
+# —— Redis（队列 + 缓存）。enabled=true 在本 ns 独立部署；false 用外部 ——
+redis:
+  enabled: true
+  image:
+    repository: your-registry/data-stack/redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+  persistence:
+    size: 5Gi
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: "1",   memory: 512Mi }
+  external:                       # 仅 enabled=false 时生效
+    host: ""
+    port: 6379
+
+# —— 复用集群 Postgres（元数据，Prisma 自迁移 schema，无扩展）——
+postgres:
+  host: postgresql-primary.postgresql
+  port: 5432
+  database: litefuse
+  # user/password 走 Secret（DATABASE_URL 整串）
+
+# —— 复用集群 MinIO（事件上传 + S3 batch export）——
+minio:
+  endpoint: http://minio.minio:9000
+  bucket: litefuse
+  region: us-east-1
+  forcePathStyle: "true"
+  # access_key/secret_key 走 Secret（MINIO_ACCESS_KEY_ID/MINIO_SECRET_ACCESS_KEY）
+
+# —— 复用集群公共 Doris DDC（分析后端）——
+doris:
+  feHttpUrl: http://litefuse-doris-fe.doris:8030
+  feQueryPort: 9030
+  database: litefuse
+  user: root
+  # password 走 Secret（DORIS_PASSWORD）
+
+# —— Litefuse 应用配置（非敏感）——
+litefuse:
+  analyticsBackend: doris
+  autoDorisMigrationDisabled: "false"   # Litefuse 启动自动建 Doris 库表（须 Storage Vault 已设默认）
+  enableBackgroundMigrations: "false"
+  telemetryEnabled: "false"
+  enableExperimentalFeatures: "false"
+  nextauthUrl: https://litefuse.example.com
+  nextPublicEnableLogging: "false"
+  timezone: Asia/Shanghai
+  # 首次启动预置 org/project/user（API key 走 Secret）
+  init:
+    enabled: "true"
+    orgId: "weknora"
+    orgName: "WeKnora"
+    projectId: "weknora-tracing"
+    projectName: "WeKnora Tracing"
+    # projectPublicKey/projectSecretKey 走 Secret
+    userEmail: "admin@weknora.local"
+    userName: "WeKnora Admin"
+
+# S3 前缀（与 Doris Storage Vault 共用同一 bucket，前缀分开避免冲突）
+s3:
+  eventUpload:
+    prefix: "events/"
+  batchExport:
+    enabled: "true"
+    prefix: "exports/"
+
+# —— Ingress ——
+ingress:
+  enabled: true
+  className: nginx
+  host: litefuse.example.com          # 内网 DNS 需解析到 ingress LB
+  tls:
+    enabled: true
+    secretName: litefuse-tls
+    selfSignedIssuer: true           # 用 cert-manager selfsigned-issuer 生成（仿 weknora 实际做法）
+
+# —— Secret ——
+secrets:
+  # 生产：create=false，由 deploy/scripts/litefuse-bootstrap.sh 预建外部 Secret（密钥不进 git）。
+  # 开发/测试：create=true + data 内联（仅本地，勿提交真实密钥）。
+  create: false
+  data: {}                      # create=true 时填充，key 同下方 existingSecret 注释清单
+  existingSecret: litefuse-secrets
+  # 预建 Secret 须含以下 key（见 deploy/scripts/litefuse-bootstrap.sh 生成）：
+  #   NEXTAUTH_SECRET          - next-auth JWT 密钥（长随机串）
+  #   SALT                     - 加密盐（≥32 字符）
+  #   ENCRYPTION_KEY           - 64 位 hex
+  #   DATABASE_URL             - postgresql://litefuse:<pw>@<host>:5432/litefuse
+  #   REDIS_AUTH               - redis 密码
+  #   MINIO_ACCESS_KEY_ID      - MinIO litefuse 用户 AK
+  #   MINIO_SECRET_ACCESS_KEY  - MinIO litefuse 用户 SK
+  #   DORIS_PASSWORD           - Doris root 密码（无则空）
+  #   LITEFUSE_INIT_PROJECT_PUBLIC_KEY  - pk-lf-<固定值>，WeKnora 对接用
+  #   LITEFUSE_INIT_PROJECT_SECRET_KEY  - sk-lf-<固定值>，WeKnora 对接用
+  #   LITEFUSE_INIT_USER_PASSWORD      - 初始管理员密码
+
+serviceAccount:
+  create: true
+  name: ""
+
+podSecurityContext:
+  fsGroup: 1001
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

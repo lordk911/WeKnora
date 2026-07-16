@@ -1,0 +1,2 @@
+# fetch-vendored.sh 下载的上游 YAML（生成物，不进 git）
+vendored/

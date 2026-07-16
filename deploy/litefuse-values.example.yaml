@@ -1,0 +1,110 @@
+# Litefuse 生产部署 values 模板（占位符，可提交到公开仓库）。
+# 复制为 litefuse-values-production.yaml，把 <...> 占位换成你的集群真值后用（该文件不进 git，见 deploy/.gitignore）。
+# 基于 deploy/litefuse-chart（appVersion 26.0.1）。镜像先推到你的仓库（deploy/scripts/mirror-litefuse-images.sh）。
+# 详细见 deploy/litefuse-k8s-deploy.md。
+#
+# 集群特定值（仓库地址/域名/PG host 等）从 deploy/.env 读的只用于脚本；
+# helm values 里的镜像仓库/ingress host 在此文件填（不进 git 的 production overlay）。
+
+global:
+  storageClass: <storage-class>      # 如 rook-ceph-block
+  imagePullSecrets: []               # 仓库公开匿名拉取则留空
+
+fullnameOverride: litefuse           # release=litefuse → svc: litefuse-web / litefuse-redis
+
+web:
+  replicaCount: 1
+  image:
+    repository: <your-registry>/data-stack/litefuse-web
+    tag: "26.0.1"
+    pullPolicy: IfNotPresent
+  strategy: Recreate
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: "2",   memory: 4Gi }
+
+worker:
+  replicaCount: 1
+  image:
+    repository: <your-registry>/data-stack/litefuse-worker
+    tag: "26.0.1"
+    pullPolicy: IfNotPresent
+  strategy: Recreate
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: "2",   memory: 4Gi }
+
+redis:
+  enabled: true                       # 独立部署（集群无专用 redis）；用外部则 enabled=false + redis.external.host
+  image:
+    repository: <your-registry>/data-stack/redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+  persistence:
+    size: 5Gi
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: "1",   memory: 512Mi }
+
+postgres:
+  host: <pg-host>                    # 如 postgresql-primary.postgresql（k8s svc）
+  port: 5432
+  database: litefuse                 # bootstrap.sh 预建空库（Prisma 自迁移 schema）
+
+minio:
+  endpoint: http://<minio-svc>:9000  # 如 http://minio.minio:9000（k8s svc，集群内 http）
+  bucket: litefuse                   # bootstrap.sh/provision-minio.sh 预建 + 专用用户
+  region: us-east-1
+  forcePathStyle: "true"
+
+doris:
+  feHttpUrl: http://<ddc-fe-svc>:8030  # 公共 Doris DDC FE service（ns=doris），如 http://litefuse-doris-fe.doris:8030
+  feQueryPort: 9030
+  database: litefuse                 # Litefuse 启动自动迁移建库表（须 Storage Vault 已设默认）
+  user: root
+
+litefuse:
+  analyticsBackend: doris
+  autoDorisMigrationDisabled: "false"
+  enableBackgroundMigrations: "false"
+  telemetryEnabled: "false"
+  enableExperimentalFeatures: "false"
+  nextauthUrl: https://<litefuse-host>
+  nextPublicEnableLogging: "false"
+  timezone: Asia/Shanghai
+  init:
+    enabled: "true"
+    orgId: "weknora"
+    orgName: "WeKnora"
+    projectId: "weknora-tracing"
+    projectName: "WeKnora Tracing"
+    userEmail: "admin@weknora.local"
+    userName: "WeKnora Admin"
+    # projectPublicKey/SecretKey 走 Secret（bootstrap.sh 生成，WeKnora 对接复用）
+
+s3:
+  eventUpload:
+    prefix: "events/"               # 与 Doris Storage Vault(doris/ddc) / batch export(exports/) 前缀分开
+  batchExport:
+    enabled: "true"
+    prefix: "exports/"
+
+ingress:
+  enabled: true
+  className: nginx
+  host: <litefuse-host>             # 内网 DNS 需解析到 ingress LB
+  tls:
+    enabled: true
+    secretName: litefuse-tls
+    selfSignedIssuer: false          # 用公司通配证书（*.<your-domain>）；bootstrap 从现有 tls secret 拷贝
+
+secrets:
+  create: false                      # 外部预建（bootstrap.sh 生成 litefuse-secrets）
+  existingSecret: litefuse-secrets
+
+serviceAccount:
+  create: true
+
+# 生产 HA 扩容（节点/流量允许时）：
+#  - web/worker replicaCount → 2-3（已从同一 Secret 注入，无单点状态）
+#  - Doris DDC FE replicas → 3、CG replicas → 3、FDB → 2-replica（需 ≥3 worker 节点）

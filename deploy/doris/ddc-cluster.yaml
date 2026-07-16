@@ -1,0 +1,34 @@
+apiVersion: disaggregated.cluster.doris.com/v1
+kind: DorisDisaggregatedCluster
+metadata:
+  name: litefuse-doris
+  namespace: doris
+  labels:
+    app.kubernetes.io/name: doris
+    app.kubernetes.io/instance: litefuse
+    app.kubernetes.io/part-of: litefuse
+spec:
+  # —— MetaService：Doris DDC 元数据服务，依赖 FoundationDB ——
+  # 26.0.0 schema：metaService 只认 image + fdb（无 resources 字段，加了会 strict decoding 报错）
+  metaService:
+    image: __HARBOR__/doris:ms-4.1.3
+    fdb:
+      configMapNamespaceName:
+        name: litefuse-fdb-config          # fdb-kubernetes-operator 生成（name=litefuse-fdb）
+        namespace: doris
+
+  # —— FE：SQL 解析与协调，无状态 ——
+  feSpec:
+    replicas: 2                             # 初始 2 副本；HA 扩 3（FE 1-host-1-instance 硬约束）
+    image: __HARBOR__/doris:fe-4.1.3
+    # 资源字段（operator 文档 spec.feSpec.requests/limits）；如 strict decoding 拒则删除这两行用默认
+    requests: { cpu: 2, memory: 4Gi }
+    limits:   { cpu: 4, memory: 8Gi }
+
+  # —— Compute Group：BE 数据摄入与本地缓存，无状态（数据落 Storage Vault=MinIO）——
+  computeGroups:
+    - uniqueId: cg1
+      replicas: 2                           # 初始 2 副本；HA 扩 3
+      image: __HARBOR__/doris:be-4.1.3
+      requests: { cpu: 2, memory: 8Gi }      # BE 内存要给足（file cache + memtable）
+      limits:   { cpu: 4, memory: 16Gi }

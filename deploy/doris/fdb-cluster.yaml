@@ -1,0 +1,68 @@
+# FoundationDB 集群（dev：单副本，redundancy_mode=single）。
+# 手写自上游 doc/examples/disaggregated/fdb/cluster-single.yaml（doris-operator 26.0.0 tag），已改：
+#   - metadata.name = litefuse-fdb → 生成 configmap litefuse-fdb-config（ddc-cluster.yaml 引用）
+#   - namespace = doris
+#   - 镜像显式指 __HARBOR__（air-gapped 集群，operator 默认从 docker.io 拉，必须 override）
+# FDB 版本 7.1.38（与上游 cluster-single 一致；operator pod 的 sidecar 是 7.1.46-1，见 vendored/fdb-operator.yaml）。
+# 生产 HA：redundancy_mode=double、processCounts 调整、≥3 worker 节点。见 README。
+apiVersion: apps.foundationdb.org/v1beta2
+kind: FoundationDBCluster
+metadata:
+  name: litefuse-fdb
+  namespace: doris
+  labels:
+    app.kubernetes.io/name: foundationdb
+    app.kubernetes.io/instance: litefuse
+    app.kubernetes.io/part-of: litefuse
+spec:
+  version: "7.1.38"                # 与上游 cluster-single 一致
+  databaseConfiguration:
+    redundancy_mode: "single"
+  automationOptions:
+    replacements:
+      enabled: true
+  imageType: split
+  minimumUptimeSecondsForBounce: 60
+  processCounts:
+    cluster_controller: 1
+    log: 2
+    storage: 2
+    stateless: -1
+  # 显式镜像 override（air-gapped harbor）。若 operator 用 spec.mainContainer/sidecarContainer
+  # 字段覆盖 podTemplate，改用那两个字段（见 deploy/doris/README.md 的 verify 项 6）。
+  processes:
+    general:
+      podTemplate:
+        spec:
+          containers:
+            - name: foundationdb
+              image: __HARBOR__/foundationdb
+              resources:
+                requests:
+                  cpu: 1
+                  memory: 2Gi
+              securityContext:
+                runAsUser: 0
+            - name: foundationdb-kubernetes-sidecar
+              image: __HARBOR__/foundationdb-kubernetes-sidecar
+              resources:
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+              securityContext:
+                runAsUser: 0
+          initContainers:
+            - name: foundationdb-kubernetes-init
+              image: __HARBOR__/foundationdb-kubernetes-sidecar
+              resources:
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+              securityContext:
+                runAsUser: 0

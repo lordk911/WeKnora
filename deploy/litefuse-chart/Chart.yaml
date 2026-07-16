@@ -1,0 +1,23 @@
+apiVersion: v2
+name: litefuse
+description: |
+  Litefuse - LLM observability & evaluation platform (langfuse-compatible, Doris analytics backend).
+  WeKnora fork packaging for self-hosted k8s deployment (see deploy/litefuse-k8s-deploy.md).
+type: application
+# Chart version; bump when templates change.
+version: 0.1.0
+# Litefuse application version.
+appVersion: "26.0.1"
+kubeVersion: ">=1.25.0-0"
+home: https://github.com/litefuse/litefuse
+sources:
+  - https://github.com/litefuse/litefuse
+keywords:
+  - llm
+  - observability
+  - tracing
+  - otel
+  - langfuse
+  - doris
+annotations:
+  artifacthub.io/license: MIT

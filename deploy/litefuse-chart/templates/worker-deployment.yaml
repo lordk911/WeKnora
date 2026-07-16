@@ -1,0 +1,113 @@
+{{/*
+Litefuse Worker — 队列消费者 + S3 batch export。port 3030。
+env = web 共享 env + S3 batch export 段。
+*/}}
+{{- if .Values.worker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "litefuse.fullname" . }}-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litefuse.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "litefuse.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  strategy:
+    type: {{ .Values.worker.strategy }}
+  template:
+    metadata:
+      labels:
+        {{- include "litefuse.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "litefuse.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: worker
+          image: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag }}"
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: 3030
+              protocol: TCP
+          env:
+            {{- include "litefuse.appEnv" . | nindent 12 }}
+            # —— S3 batch export（worker 专属）——
+            - name: LITEFUSE_S3_BATCH_EXPORT_ENABLED
+              value: {{ .Values.s3.batchExport.enabled | quote }}
+            - name: LITEFUSE_S3_BATCH_EXPORT_BUCKET
+              value: {{ .Values.minio.bucket | quote }}
+            - name: LITEFUSE_S3_BATCH_EXPORT_PREFIX
+              value: {{ .Values.s3.batchExport.prefix | quote }}
+            - name: LITEFUSE_S3_BATCH_EXPORT_REGION
+              value: {{ .Values.minio.region | quote }}
+            - name: LITEFUSE_S3_BATCH_EXPORT_ENDPOINT
+              value: {{ .Values.minio.endpoint | quote }}
+            - name: LITEFUSE_S3_BATCH_EXPORT_EXTERNAL_ENDPOINT
+              value: {{ .Values.minio.endpoint | quote }}
+            - name: LITEFUSE_S3_BATCH_EXPORT_ACCESS_KEY_ID
+              valueFrom: { secretKeyRef: { name: {{ include "litefuse.secretName" . }}, key: MINIO_ACCESS_KEY_ID } }
+            - name: LITEFUSE_S3_BATCH_EXPORT_SECRET_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ include "litefuse.secretName" . }}, key: MINIO_SECRET_ACCESS_KEY } }
+            - name: LITEFUSE_S3_BATCH_EXPORT_FORCE_PATH_STYLE
+              value: {{ .Values.minio.forcePathStyle | quote }}
+          # Worker 无 HTTP 健康端点；用进程探活（与官方 compose 一致）。
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "ps aux | grep 'node worker/dist/index.js' | grep -v grep"]
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-c", "ps aux | grep 'node worker/dist/index.js' | grep -v grep"]
+            periodSeconds: 10
+            failureThreshold: 30
+          {{- with .Values.worker.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "litefuse.fullname" . }}-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litefuse.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  type: ClusterIP
+  ports:
+    - name: metrics
+      port: 3030
+      targetPort: metrics
+      protocol: TCP
+  selector:
+    {{- include "litefuse.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+{{- end }}

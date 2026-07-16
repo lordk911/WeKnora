@@ -1,0 +1,6 @@
+# doris 上游 vendored YAML（fetch-vendored.sh 生成，不进 git）
+doris/vendored/
+
+# 性能测试报告（本地产物，含测试凭据，不进 git）
+storage-perf-bench-*.md
+litefuse-values-production.yaml

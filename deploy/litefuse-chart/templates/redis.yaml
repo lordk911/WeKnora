@@ -1,0 +1,88 @@
+{{/*
+Dedicated Redis（队列 + 缓存）。StatefulSet + PVC(rook-ceph-block)。
+与 weknora redis 隔离。enabled=false 时整块不渲染（用外部 redis）。
+*/}}
+{{- if .Values.redis.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "litefuse.fullname" . }}-redis
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litefuse.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  serviceName: {{ include "litefuse.fullname" . }}-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "litefuse.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        {{- include "litefuse.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: redis
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          command: ["redis-server", "--requirepass", "$(REDIS_AUTH)", "--appendonly", "yes"]
+          env:
+            - name: REDIS_AUTH
+              valueFrom: { secretKeyRef: { name: {{ include "litefuse.secretName" . }}, key: REDIS_AUTH } }
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "-a", "$(REDIS_AUTH)", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "-a", "$(REDIS_AUTH)", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          {{- with .Values.redis.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.global.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "litefuse.fullname" . }}-redis
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "litefuse.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  type: ClusterIP
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+  selector:
+    {{- include "litefuse.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+{{- end }}
