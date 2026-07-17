@@ -57,11 +57,9 @@ func GinMiddleware() gin.HandlerFunc {
 		c.Next()
 
 		trace.Finish(map[string]interface{}{
-			"status": c.Writer.Status(),
-		}, map[string]interface{}{
-			"http.status_code": c.Writer.Status(),
-			"response.size":    c.Writer.Size(),
-		})
+			"status":        c.Writer.Status(),
+			"response.size": c.Writer.Size(),
+		}, nil)
 	}
 }
 

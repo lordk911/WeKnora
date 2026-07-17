@@ -115,12 +115,15 @@ func (m *Manager) StartTrace(ctx context.Context, opts TraceOptions) (context.Co
 }
 
 // Finish updates the trace with its final output. Safe to call on a disabled
-// trace (no-op).
+// trace (no-op). The trace's metadata attribute (request_id, http.method,
+// etc.) is set once at StartTrace and left untouched here — overwriting it
+// with the finish metadata would lose the open's correlation fields.
 func (t *Trace) Finish(output interface{}, metadata map[string]interface{}) {
+	_ = metadata
 	if t == nil || t.manager == nil || !t.manager.Enabled() || t.span == nil {
 		return
 	}
-	t.span.SetAttributes(jsonAttr(attrTraceOutput, output), jsonAttr(attrTraceMetadata, metadata))
+	t.span.SetAttributes(jsonAttr(attrTraceOutput, output))
 	t.span.End()
 }
 
@@ -179,12 +182,14 @@ func (m *Manager) StartSpan(ctx context.Context, opts SpanOptions) (context.Cont
 }
 
 // Finish updates a span with its final output, extra metadata and any error.
-// A non-nil err marks the span as ERROR.
+// A non-nil err marks the span as ERROR. The span's metadata attribute is set
+// once at StartSpan and left untouched here.
 func (s *Span) Finish(output interface{}, metadata map[string]interface{}, err error) {
+	_ = metadata
 	if s == nil || s.manager == nil || !s.manager.Enabled() || s.span == nil {
 		return
 	}
-	s.span.SetAttributes(jsonAttr(attrObsOutput, output), jsonAttr(attrObsMetadata, metadata))
+	s.span.SetAttributes(jsonAttr(attrObsOutput, output))
 	if err != nil {
 		s.span.RecordError(err)
 		s.span.SetStatus(codes.Error, err.Error())
