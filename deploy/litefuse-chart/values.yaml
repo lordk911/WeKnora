@@ -15,7 +15,7 @@ web:
   replicaCount: 1                  # 多副本前需确认 NEXTAUTH/ENCRYPTION 一致（已从同一 Secret 注入，可扩）
   image:
     repository: your-registry/data-stack/litefuse-web
-    tag: "26.0.1"
+    tag: "26.1.1"
     pullPolicy: IfNotPresent
   strategy: Recreate              # 与 weknora app 一致，规避 RWO 卷滚动死锁（web 无状态但保持一致）
   resources:
@@ -28,12 +28,19 @@ worker:
   replicaCount: 1
   image:
     repository: your-registry/data-stack/litefuse-worker
-    tag: "26.0.1"
+    tag: "26.1.1"
     pullPolicy: IfNotPresent
   strategy: Recreate
   resources:
     requests: { cpu: 500m, memory: 1Gi }
     limits:   { cpu: "2",   memory: 4Gi }
+  # 关闭 S3 ingestion 文件索引(blob_storage_file_log)。Litefuse 默认 true，但：
+  # ① OTLP 路径(/api/public/otel，WeKnora 用的)根本不写这张表(上游 otelIngestionQueue.ts:223 TODO 未实现)；
+  # ② 删 trace 时该路径会跑 removeIngestionEventsFromS3AndDeleteDorisRefsForTraces，其
+  #    blobStorageLog.ts:127 查询仍 `from observations`(表不存在)→ 报错→ pending_deletions 不清。
+  # 设 false 跳过该坏查询。详见 deploy/litefuse-delete-bug-notes.md。
+  # 将来升级：检查上游 TODO 是否实现 + blobStorageLog.ts observations→events_full 是否修复。
+  enableBlobStorageFileLog: false
 
 # —— Redis（队列 + 缓存）。enabled=true 在本 ns 独立部署；false 用外部 ——
 redis:

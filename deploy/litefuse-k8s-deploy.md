@@ -162,7 +162,7 @@ helm -n weknora upgrade weknora ./helm -f deploy/values-production.yaml
 ## 8. 运维
 
 - 改配置：编辑 [litefuse-values-production.yaml](litefuse-values-production.yaml) → `helm -n litefuse upgrade litefuse deploy/litefuse-chart -f deploy/litefuse-values-production.yaml`。
-- 升级 LiteFuse：mirror 新 tag → 改 values `web/worker.image.tag` → helm upgrade。
+- 升级 LiteFuse：mirror 新 tag → 改 values `web/worker.image.tag` → helm upgrade。**升级前必读 [litefuse-delete-bug-notes.md](litefuse-delete-bug-notes.md) 第 4 节**——核实上游 `blobStorageLog.ts:127` 的 `from observations` 是否已修、issue #30/#31 状态、OTLP file_log TODO 是否实现；全部修复后可重新打开 `worker.enableBlobStorageFileLog`。
 - 备份：PG 元数据 `pg_dump`（连 postgresql-primary）；MinIO bucket `litefuse`；Doris 数据在 MinIO `doris/ddc` 前缀下。
 - 卸载：`helm -n litefuse uninstall litefuse`；Doris `kubectl delete ddc -n doris litefuse-doris`；FDB `kubectl delete fdb -n doris litefuse-fdb`。`down -v` 等价：删 PVC + MinIO bucket（**不可逆**）。
 

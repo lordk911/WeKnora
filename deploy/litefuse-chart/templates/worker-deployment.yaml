@@ -56,6 +56,10 @@ spec:
               protocol: TCP
           env:
             {{- include "litefuse.appEnv" . | nindent 12 }}
+            # —— blob_storage_file_log 关闭（见 values.yaml worker.enableBlobStorageFileLog 注释 +
+            #    deploy/litefuse-delete-bug-notes.md）。上游 bug 残留，OTLP 路径用不到且会触发删 trace 报错。
+            - name: LITEFUSE_ENABLE_BLOB_STORAGE_FILE_LOG
+              value: {{ .Values.worker.enableBlobStorageFileLog | quote }}
             # —— S3 batch export（worker 专属）——
             - name: LITEFUSE_S3_BATCH_EXPORT_ENABLED
               value: {{ .Values.s3.batchExport.enabled | quote }}
