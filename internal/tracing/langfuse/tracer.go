@@ -160,6 +160,26 @@ func (m *Manager) ResumeTrace(ctx context.Context, traceID, parentSpanID string)
 	return withTrace(ctx, t), t
 }
 
+// reestablishParentSpan re-injects the active trace's root span as the OTel
+// parent when ctx carries a *Trace but no active OTel span. This happens when
+// a context rebuild drops the OTel span while the *Trace handle survives on
+// the exported key (e.g. a background goroutine derived from a non-request
+// context, or a CloneContext that predates/missed the span fix). Without
+// this, child spans (e.g. a summary generation) start a fresh root and orphan
+// off the HTTP trace.
+func (m *Manager) reestablishParentSpan(ctx context.Context) context.Context {
+	if !m.Enabled() {
+		return ctx
+	}
+	if sp := trace.SpanFromContext(ctx); sp.IsRecording() {
+		return ctx // already has an active span
+	}
+	if t, ok := traceFromCtx(ctx); ok && t != nil && t.span != nil {
+		return trace.ContextWithSpan(ctx, t.span)
+	}
+	return ctx
+}
+
 // StartSpan opens a child span under the trace/span carried by ctx. When no
 // trace is present, OTel creates a fresh root (mirroring StartGeneration's
 // auto-trace behaviour). Returns a ctx whose active span is this span.
@@ -167,6 +187,7 @@ func (m *Manager) StartSpan(ctx context.Context, opts SpanOptions) (context.Cont
 	if !m.Enabled() {
 		return ctx, &Span{manager: m}
 	}
+	ctx = m.reestablishParentSpan(ctx)
 	if _, ok := traceFromCtx(ctx); !ok {
 		// No active trace: open a shallow root so the span isn't orphaned.
 		newCtx, _ := m.StartTrace(ctx, TraceOptions{Name: opts.Name})
@@ -204,6 +225,7 @@ func (m *Manager) StartGeneration(ctx context.Context, opts GenerationOptions) (
 	if !m.Enabled() {
 		return ctx, &Generation{manager: m, model: opts.Model, name: opts.Name}
 	}
+	ctx = m.reestablishParentSpan(ctx)
 	if _, ok := traceFromCtx(ctx); !ok {
 		newCtx, _ := m.StartTrace(ctx, TraceOptions{Name: opts.Name})
 		ctx = newCtx
